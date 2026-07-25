@@ -1,0 +1,22 @@
+{
+  "name": "video-analytic",
+  "version": "1.0.0",
+  "description": "",
+  "main": "main.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "node --watch src/app.js"
+  },
+  "keywords": [],
+  "author": "Olders-Alex",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "electron": "^43.2.0"
+  },
+  "dependencies": {
+    "@u4/opencv4nodejs": "^7.1.2",
+    "dotenv": "^17.4.2",
+    "opencv-wasm": "^4.3.0-10"
+  }
+}

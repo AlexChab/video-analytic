@@ -1,0 +1,34 @@
+{
+  "name": "video-analytic",
+  "version": "1.0.0",
+  "description": "",
+  "main": "main.js",
+
+  "scripts": {
+    "start": "set \"PATH=C:\\project\\opencv\\install-contrib\\x64\\vc17\\bin;%PATH%\" && node src/app.js",
+    "dev": "set \"PATH=C:\\project\\opencv\\install-contrib\\x64\\vc17\\bin;%PATH%\" && node --watch src/app.js",
+    "test:csrt": "set \"PATH=C:\\project\\opencv\\install-contrib\\x64\\vc17\\bin;%PATH%\" && node tests/csrtSmokeTest.js",
+    "test:tracker": "set \"PATH=C:\\project\\opencv\\install-contrib\\x64\\vc17\\bin;%PATH%\" && node tests/objectTrackerTest.js"
+  },
+  "keywords": [],
+  "author": "Olders-Alex",
+  "license": "ISC",
+  "type": "commonjs",
+
+  "opencv4nodejs": {
+    "disableAutoBuild": 1,
+    "opencvIncludeDir": "C:\\project\\opencv\\install-contrib\\include",
+    "opencvLibDir": "C:\\project\\opencv\\install-contrib\\x64\\vc17\\lib",
+    "opencvBinDir": "C:\\project\\opencv\\install-contrib\\x64\\vc17\\bin"
+  },
+
+  "devDependencies": {
+    "electron": "^43.2.0"
+  },
+
+  "dependencies": {
+    "@u4/opencv4nodejs": "^7.1.2",
+    "dotenv": "^17.4.2",
+    "opencv-wasm": "^4.3.0-10"
+  }
+}
