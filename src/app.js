@@ -684,6 +684,7 @@ reader.on('close', ({ code, signal, expected }) => {
  */
 const fpsTimer = setInterval(() => {
   const bufferStats = latestFrameBuffer.getStats();
+  const performanceStats = frameProcessor.getPerformanceStats();
 
   const droppedDuringSecond = bufferStats.droppedFrames - previousDroppedFrames;
 
@@ -695,6 +696,51 @@ const fpsTimer = setInterval(() => {
       `пропущено=${droppedDuringSecond} FPS, ` +
       `просрочено=${staleFramesDropped}, ` +
       `всего входных=${totalFrames}`,
+  );
+  /**
+   * Форматирует один этап профилирования.
+   *
+   * averageMs показывает обычное время,
+   * maxMs помогает увидеть кратковременные зависания.
+   */
+  const formatMetric = (name) => {
+    const metric = performanceStats[name];
+
+    if (!metric || metric.calls === 0) {
+      return 'нет вызовов';
+    }
+
+    return (
+      `${metric.averageMs.toFixed(1)} мс среднее, ` +
+      `${metric.maxMs.toFixed(1)} мс максимум, ` +
+      `${metric.calls} вызовов`
+    );
+  };
+
+  console.log('[Профайлер] ' + `весь кадр: ${formatMetric('total')}`);
+
+  console.log(
+    '[Профайлер] ' +
+      `MotionDetector: ${formatMetric('motionDetector')}; ` +
+      `TargetSelector: ${formatMetric('targetSelector')}`,
+  );
+
+  console.log(
+    '[Профайлер] ' +
+      `CSRT start: ${formatMetric('trackerStart')}; ` +
+      `CSRT update: ${formatMetric('trackerUpdate')}`,
+  );
+
+  console.log(
+    '[Профайлер] ' +
+      `PTZ calculate: ${formatMetric('ptzCalculate')}; ` +
+      `PTZ execute: ${formatMetric('ptzExecute')}`,
+  );
+
+  console.log(
+    '[Профайлер] ' +
+      `Renderer: ${formatMetric('renderer')}; ` +
+      `копирование Buffer: ${formatMetric('frameBufferCopy')}`,
   );
 
   framesSinceLastReport = 0;

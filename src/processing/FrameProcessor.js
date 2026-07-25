@@ -1,4 +1,5 @@
 'use strict';
+const { performance } = require('node:perf_hooks');
 
 const cv = require('@u4/opencv4nodejs');
 
@@ -11,15 +12,26 @@ const FrameRenderer = require('../rendering/FrameRenderer');
 /**
  * Координатор обработки одного видеокадра.
  *
- * Полная цепочка:
+ * Полная цепочка в режиме поиска:
  *
  * BGR-кадр
  *   → обнаружение движения
  *   → выбор цели
  *   → захват цели CSRT
- *   → сопровождение цели
  *   → расчёт PTZ-команды
- *   → отрисовка рамок и состояния
+ *   → отрисовка результата
+ *
+ * Полная цепочка в режиме сопровождения:
+ *
+ * BGR-кадр
+ *   → обновление CSRT
+ *   → расчёт PTZ-команды
+ *   → отрисовка результата
+ *
+ * Важно:
+ * пока CSRT активно сопровождает цель, MotionDetector не запускается.
+ * Это уменьшает нагрузку на процессор и предотвращает резкое замедление
+ * при появлении в кадре больших движущихся объектов.
  */
 class FrameProcessor {
   /**
@@ -28,9 +40,29 @@ class FrameProcessor {
    * @param {number} options.height Высота кадра.
    */
   constructor({ width, height }) {
+    if (!Number.isInteger(width) || width <= 0) {
+      throw new Error('Ширина кадра должна быть положительным целым числом');
+    }
+
+    if (!Number.isInteger(height) || height <= 0) {
+      throw new Error('Высота кадра должна быть положительным целым числом');
+    }
+
     this.width = width;
     this.height = height;
     this.channels = 3;
+    this.previousState = 'SEARCHING';
+    this.performanceStats = {
+      total: this.#createPerformanceMetric(),
+      motionDetector: this.#createPerformanceMetric(),
+      targetSelector: this.#createPerformanceMetric(),
+      trackerStart: this.#createPerformanceMetric(),
+      trackerUpdate: this.#createPerformanceMetric(),
+      ptzCalculate: this.#createPerformanceMetric(),
+      ptzExecute: this.#createPerformanceMetric(),
+      renderer: this.#createPerformanceMetric(),
+      frameBufferCopy: this.#createPerformanceMetric(),
+    };
 
     /**
      * Ожидаемый размер одного BGR24-кадра.
@@ -49,8 +81,7 @@ class FrameProcessor {
     /**
      * Детектор движущихся областей.
      *
-     * Он используется прежде всего для первоначального обнаружения цели
-     * и повторного захвата после её потери.
+     * Он используется только тогда, когда CSRT не сопровождает цель.
      */
     this.motionDetector = new MotionDetector({
       minArea: 3000,
@@ -61,8 +92,8 @@ class FrameProcessor {
     /**
      * Выбирает наиболее подходящую область среди обнаружений.
      *
-     * TargetSelector отвечает только за выбор кандидата.
-     * После захвата точное сопровождение выполняет CSRT.
+     * TargetSelector используется только для первоначального
+     * захвата или повторного захвата цели.
      */
     this.targetSelector = new TargetSelector({
       frameWidth: width,
@@ -85,8 +116,6 @@ class FrameProcessor {
 
     /**
      * Вычисляет направление движения PTZ.
-     *
-     * Метод execute() пока только выводит команды в консоль.
      */
     this.ptzController = new PtzController({
       frameWidth: width,
@@ -97,7 +126,7 @@ class FrameProcessor {
     });
 
     /**
-     * Накладывает служебную графику на видео.
+     * Накладывает служебную графику на видеокадр.
      */
     this.renderer = new FrameRenderer({
       frameWidth: width,
@@ -108,10 +137,10 @@ class FrameProcessor {
     });
 
     /**
-     * Предыдущее итоговое состояние.
+     * Предыдущее итоговое состояние системы.
      *
-     * Используется для вывода сообщений о захвате и потере цели
-     * только один раз, а не на каждом кадре.
+     * Используется, чтобы сообщения о захвате и потере цели
+     * выводились только при фактическом изменении состояния.
      */
     this.previousState = 'SEARCHING';
   }
@@ -133,64 +162,129 @@ class FrameProcessor {
    */
   process(frameBuffer, metadata = {}) {
     this.validateFrame(frameBuffer);
+    /**
+     * Начало измерения полного времени обработки кадра.
+     */
+    const totalStartedAt = performance.now();
 
     /**
-     * Создаём OpenCV Mat из BGR24 Buffer.
+     * Создаём OpenCV Mat из входного BGR24 Buffer.
      */
     const frame = new cv.Mat(frameBuffer, this.height, this.width, cv.CV_8UC3);
 
     /**
-     * Ищем области движения.
+     * Массив обнаружений остаётся пустым во время работы CSRT.
+     *
+     * Это позволяет рендереру продолжать получать ожидаемый тип данных,
+     * но не заставляет MotionDetector выполнять тяжёлые операции.
      */
-    const detections = this.motionDetector.detect(frame);
+    let detections = [];
 
     /**
-     * TargetSelector выбирает кандидата для первоначального захвата.
+     * Выбранный TargetSelector кандидат.
+     *
+     * Во время активного CSRT новый кандидат не нужен.
      */
-    const selection = this.targetSelector.update(detections);
+    let selection = null;
 
     let trackedRect = null;
     let targetCenter = null;
     let trackerJustStarted = false;
 
     /**
-     * Если CSRT пока не работает, пытаемся захватить цель,
-     * которую выбрал TargetSelector.
+     * Проверяем состояние трекера до запуска детектора движения.
      */
-    if (!this.objectTracker.isActive() && selection && selection.target) {
-      try {
-        trackedRect = this.objectTracker.start(frame, selection.target);
+    const trackerWasActive = this.objectTracker.isActive();
 
-        targetCenter = this.objectTracker.getCenter();
+    /**
+     * MotionDetector и TargetSelector запускаются только тогда,
+     * когда система ещё не сопровождает объект.
+     *
+     * Раньше детектор движения выполнялся на каждом кадре,
+     * даже при активном CSRT. На больших движущихся объектах
+     * операции dilate() и findContours() могли значительно
+     * увеличивать время обработки.
+     */
+    if (!trackerWasActive) {
+      // detections = this.motionDetector.detect(frame);
+      const motionDetectorStartedAt = performance.now();
 
-        trackerJustStarted = true;
-      } catch (error) {
-        console.error('[CSRT] Не удалось захватить цель:', error.message);
+      detections = this.motionDetector.detect(frame);
 
-        this.objectTracker.reset('Ошибка первоначального захвата');
+      this.#recordPerformance(
+        'motionDetector',
+        performance.now() - motionDetectorStartedAt,
+      );
+
+      // selection = this.targetSelector.update(detections);
+      const targetSelectorStartedAt = performance.now();
+
+      selection = this.targetSelector.update(detections);
+
+      this.#recordPerformance(
+        'targetSelector',
+        performance.now() - targetSelectorStartedAt,
+      );
+
+      /**
+       * Пытаемся захватить выбранную цель.
+       */
+      if (selection && selection.target) {
+        try {
+          // trackedRect = this.objectTracker.start(frame, selection.target);
+          const trackerStartStartedAt = performance.now();
+
+          trackedRect = this.objectTracker.start(frame, selection.target);
+
+          this.#recordPerformance(
+            'trackerStart',
+            performance.now() - trackerStartStartedAt,
+          );
+
+          targetCenter = this.objectTracker.getCenter();
+
+          trackerJustStarted = true;
+
+          /**
+           * После захвата старая база MotionDetector больше не нужна.
+           *
+           * Если CSRT позднее потеряет объект, детектор сначала
+           * создаст новую актуальную базу сравнения, а не будет
+           * сравнивать кадр с очень старым изображением.
+           */
+          this.motionDetector.reset();
+        } catch (error) {
+          console.error('[CSRT] Не удалось захватить цель:', error.message);
+
+          this.objectTracker.reset('Ошибка первоначального захвата');
+        }
       }
     }
 
     /**
-     * Если трекер уже был активен до текущего кадра,
+     * Если трекер был активен до начала обработки текущего кадра,
      * обновляем положение объекта.
      *
-     * В кадре первоначального захвата update() не вызываем:
-     * init() уже получил этот же кадр и начальный ROI.
+     * В кадре первоначального захвата update() не вызывается:
+     * init() уже получил этот кадр и начальный ROI.
      */
     if (this.objectTracker.isActive() && !trackerJustStarted) {
+      // trackedRect = this.objectTracker.update(frame);
+      const trackerUpdateStartedAt = performance.now();
+
       trackedRect = this.objectTracker.update(frame);
 
+      this.#recordPerformance(
+        'trackerUpdate',
+        performance.now() - trackerUpdateStartedAt,
+      );
       if (trackedRect) {
         targetCenter = this.objectTracker.getCenter();
       }
     }
 
     /**
-     * Если в одном кадре CSRT не вернул координаты, но ещё не был
-     * окончательно сброшен, не передаём устаревшую координату в PTZ.
-     *
-     * Камера в этот момент получает STOP.
+     * Получаем актуальное состояние CSRT после start() или update().
      */
     const trackerActive = this.objectTracker.isActive();
 
@@ -199,6 +293,10 @@ class FrameProcessor {
     if (trackedRect && targetCenter) {
       state = 'TRACKING';
     } else if (trackerActive) {
+      /**
+       * Трекер ещё не сброшен, но на текущем кадре
+       * не смог вернуть достоверный прямоугольник.
+       */
       state = 'TEMPORARILY_LOST';
     }
 
@@ -208,12 +306,21 @@ class FrameProcessor {
      */
     const tracking = {
       state,
+
+      /**
+       * Кандидат TargetSelector присутствует только
+       * во время поиска и первоначального захвата.
+       */
       target: selection?.target ?? null,
+
       targetCenter,
       trackedRect,
       trackerActive,
+
       justCaptured: state === 'TRACKING' && this.previousState !== 'TRACKING',
+
       justLost: state === 'SEARCHING' && this.previousState !== 'SEARCHING',
+
       trackerState: this.objectTracker.getState(),
     };
 
@@ -221,7 +328,9 @@ class FrameProcessor {
       console.log(
         '[CSRT] Цель захвачена: ' +
           `x=${Math.round(targetCenter.x)}, ` +
-          `y=${Math.round(targetCenter.y)}`,
+          `y=${Math.round(targetCenter.y)}, ` +
+          `размер=${Math.round(trackedRect.width)}x` +
+          `${Math.round(trackedRect.height)}`,
       );
     }
 
@@ -230,14 +339,27 @@ class FrameProcessor {
     }
 
     /**
-     * PTZ получает только актуальный центр сопровождаемой цели.
+     * PTZ получает только актуальный центр
+     * успешно сопровождаемой цели.
      */
+    // const ptzCommand = this.ptzController.calculate(
+    //   state === 'TRACKING' ? targetCenter : null,
+    // );
+
+    const ptzCalculateStartedAt = performance.now();
+
     const ptzCommand = this.ptzController.calculate(
       state === 'TRACKING' ? targetCenter : null,
     );
 
+    this.#recordPerformance(
+      'ptzCalculate',
+      performance.now() - ptzCalculateStartedAt,
+    );
+
     /**
-     * При отсутствии надёжного сопровождения камера должна стоять.
+     * При отсутствии надёжного сопровождения
+     * камера должна остановиться.
      */
     if (state !== 'TRACKING') {
       ptzCommand.pan = 'STOP';
@@ -246,16 +368,31 @@ class FrameProcessor {
     }
 
     /**
-     * Оставляем существующий вывод PTZ в консоль.
-     *
-     * Позже внутри execute() можно будет подключить ONVIF/HTTP-клиент,
-     * не меняя остальную обработку.
+     * Передаём рассчитанную команду исполнительному модулю.
      */
+    // this.ptzController.execute(ptzCommand, state);
+    const ptzExecuteStartedAt = performance.now();
+
     this.ptzController.execute(ptzCommand, state);
 
+    this.#recordPerformance(
+      'ptzExecute',
+      performance.now() - ptzExecuteStartedAt,
+    );
+
     /**
-     * Накладываем графику прямо на видеокадр.
+     * Накладываем графику прямо на текущий видеокадр.
      */
+    // this.renderer.render({
+    //   frame,
+    //   detections,
+    //   selection: tracking,
+    //   trackedRect,
+    //   ptzCommand,
+    //   metadata,
+    // });
+    const rendererStartedAt = performance.now();
+
     this.renderer.render({
       frame,
       detections,
@@ -265,19 +402,36 @@ class FrameProcessor {
       metadata,
     });
 
+    this.#recordPerformance('renderer', performance.now() - rendererStartedAt);
     this.previousState = state;
+    /**
+     * Получение данных Mat и создание независимой копии кадра.
+     *
+     * Для кадра 1280×720 BGR24 копируется примерно 2,8 МБ.
+     */
+    const frameBufferCopyStartedAt = performance.now();
 
+    const processedFrameBuffer = Buffer.from(frame.getData());
+
+    this.#recordPerformance(
+      'frameBufferCopy',
+      performance.now() - frameBufferCopyStartedAt,
+    );
+    this.#recordPerformance('total', performance.now() - totalStartedAt);
     return {
       /**
-       * Mat нужен для быстрого вывода через cv.imshow().
+       * OpenCV Mat используется для быстрого
+       * отображения через cv.imshow().
        */
       frame,
 
       /**
-       * Buffer можно использовать для FFmpeg, WebSocket,
-       * сохранения JPEG или дальнейшей передачи.
+       * Независимый Buffer обработанного кадра.
+       *
+       * Он используется, например, при сохранении JPEG.
        */
-      frameBuffer: Buffer.from(frame.getData()),
+      // frameBuffer: Buffer.from(frame.getData()),
+      frameBuffer: processedFrameBuffer,
 
       detections,
       tracking,
@@ -307,10 +461,12 @@ class FrameProcessor {
   /**
    * Сбрасывает все компоненты сопровождения.
    *
-   * Можно вызывать при перезапуске RTSP или изменении камеры.
+   * Можно вызывать при перезапуске RTSP
+   * или изменении камеры.
    */
   reset() {
     this.motionDetector.reset();
+
     this.objectTracker.reset('Сброс FrameProcessor');
 
     if (
@@ -321,6 +477,78 @@ class FrameProcessor {
     }
 
     this.previousState = 'SEARCHING';
+  }
+  /**
+   * Создаёт пустой счётчик производительности.
+   *
+   * @returns {{
+   *   totalMs: number,
+   *   maxMs: number,
+   *   calls: number
+   * }}
+   */
+  #createPerformanceMetric() {
+    return {
+      totalMs: 0,
+      maxMs: 0,
+      calls: 0,
+    };
+  }
+
+  /**
+   * Добавляет результат одного измерения.
+   *
+   * @param {string} metricName Название этапа.
+   * @param {number} durationMs Продолжительность в миллисекундах.
+   */
+  #recordPerformance(metricName, durationMs) {
+    const metric = this.performanceStats[metricName];
+
+    if (!metric || !Number.isFinite(durationMs)) {
+      return;
+    }
+
+    metric.totalMs += durationMs;
+    metric.calls += 1;
+
+    if (durationMs > metric.maxMs) {
+      metric.maxMs = durationMs;
+    }
+  }
+
+  /**
+   * Возвращает статистику за прошедший интервал
+   * и сразу начинает новый интервал измерений.
+   *
+   * @returns {Object<string, {
+   *   calls: number,
+   *   averageMs: number,
+   *   maxMs: number,
+   *   totalMs: number
+   * }>}
+   */
+  getPerformanceStats() {
+    const result = {};
+
+    for (const [name, metric] of Object.entries(this.performanceStats)) {
+      result[name] = {
+        calls: metric.calls,
+
+        averageMs: metric.calls > 0 ? metric.totalMs / metric.calls : 0,
+
+        maxMs: metric.maxMs,
+        totalMs: metric.totalMs,
+      };
+
+      /**
+       * Обнуляем накопленные значения,
+       * чтобы следующая выдача содержала данные
+       * только за новый интервал.
+       */
+      this.performanceStats[name] = this.#createPerformanceMetric();
+    }
+
+    return result;
   }
 }
 
