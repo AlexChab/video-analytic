@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "clear-day",
+  "name": "Ясный день",
+  "scope": "preset",
+  "readOnly": true,
+  "description": "Базовый предустановленный профиль. Наследует параметры motion.config.js.",
+  "basedOn": "motion.config",
+  "createdAt": null,
+  "updatedAt": null,
+  "revision": 1,
+  "lastChange": null,
+  "parameters": {}
+}

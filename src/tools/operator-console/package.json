@@ -1,0 +1,13 @@
+{
+  "name": "tracking-operator-console",
+  "version": "0.4.0",
+  "private": true,
+  "description": "Operator Console v2: SEARCH/TRACKING и автоматическое обогащение цели",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,29 +1,22 @@
+'use strict';
+
 require('dotenv').config();
 
 /**
- * Читает обязательную строковую переменную окружения.
- *
- * @param {string} name Название переменной.
- * @returns {string}
- */
-function getRequiredString(name) {
-  const value = process.env[name]?.trim();
-
-  if (!value) {
-    throw new Error(`Не задана обязательная переменная окружения: ${name}`);
-  }
-
-  return value;
-}
-
-/**
  * Читает положительное целое число из переменной окружения.
+ * Если переменная не задана, используется значение по умолчанию.
  *
- * @param {string} name Название переменной.
+ * @param {string} name Название переменной окружения.
+ * @param {number} defaultValue Значение по умолчанию.
  * @returns {number}
  */
-function getPositiveInteger(name) {
-  const rawValue = getRequiredString(name);
+function getPositiveInteger(name, defaultValue) {
+  const rawValue = process.env[name]?.trim();
+
+  if (!rawValue) {
+    return defaultValue;
+  }
+
   const value = Number.parseInt(rawValue, 10);
 
   if (!Number.isInteger(value) || value <= 0) {
@@ -35,58 +28,96 @@ function getPositiveInteger(name) {
   return value;
 }
 
-const host = getRequiredString('CAMERA_HOST');
-const port = getPositiveInteger('CAMERA_RTSP_PORT');
-const username = getRequiredString('CAMERA_USERNAME');
-const password = getRequiredString('CAMERA_PASSWORD');
+/**
+ * Проверяет RTSP URL и возвращает его в нормализованном виде.
+ *
+ * Камера может работать как без авторизации:
+ *   rtsp://192.168.1.101:554/video1
+ *
+ * так и с авторизацией:
+ *   rtsp://user:password@192.168.1.101:554/video1
+ *
+ * @param {string} value RTSP URL.
+ * @returns {string}
+ */
+function normalizeRtspUrl(value) {
+  const rtspUrl = value.trim();
 
-const configuredPath = getRequiredString('CAMERA_RTSP_PATH');
-const streamPath = configuredPath.startsWith('/')
-  ? configuredPath
-  : `/${configuredPath}`;
+  if (!/^rtsps?:\/\//i.test(rtspUrl)) {
+    throw new Error(
+      'CAMERA_RTSP_URL должен начинаться с rtsp:// или rtsps://',
+    );
+  }
 
-const transport = (process.env.RTSP_TRANSPORT || 'tcp').toLowerCase();
+  return rtspUrl;
+}
+
+/**
+ * Создаёт безопасный вариант адреса для журналирования.
+ * Если в URL присутствуют логин и пароль, пароль заменяется на ***.
+ * Для камеры без авторизации адрес остаётся без изменений.
+ *
+ * @param {string} rtspUrl Полный RTSP URL.
+ * @returns {string}
+ */
+function createSafeRtspUrl(rtspUrl) {
+  try {
+    const parsedUrl = new URL(rtspUrl);
+
+    if (parsedUrl.password) {
+      parsedUrl.password = '***';
+    }
+
+    return parsedUrl.toString();
+  } catch {
+    // Сам URL уже проверен выше. Резервная маскировка нужна только
+    // на случай особенностей конкретной версии Node.js.
+    return rtspUrl.replace(
+      /^(rtsps?:\/\/[^:@/]+):[^@/]+@/i,
+      '$1:***@',
+    );
+  }
+}
+
+/**
+ * Основной RTSP-источник.
+ *
+ * Для текущей камеры авторизация не требуется, поэтому достаточно адреса:
+ *   rtsp://192.168.1.101:554/video1
+ *
+ * При необходимости адрес можно переопределить через CAMERA_RTSP_URL
+ * в файле .env, не изменяя исходный код.
+ */
+const rtspUrl = normalizeRtspUrl(
+  process.env.CAMERA_RTSP_URL || 'rtsp://192.168.1.101:554/video1',
+);
+
+const transport = (process.env.RTSP_TRANSPORT || 'tcp')
+  .trim()
+  .toLowerCase();
 
 if (!['tcp', 'udp'].includes(transport)) {
   throw new Error('RTSP_TRANSPORT должен иметь значение tcp или udp');
 }
 
-/**
- * Кодируем логин и пароль, чтобы специальные символы не ломали RTSP URL.
- */
-const encodedUsername = encodeURIComponent(username);
-const encodedPassword = encodeURIComponent(password);
-
-/**
- * Полный адрес используется только для подключения.
- * Его нельзя выводить в журналы, поскольку внутри находится пароль.
- */
-const rtspUrl =
-  `rtsp://${encodedUsername}:${encodedPassword}` +
-  `@${host}:${port}${streamPath}`;
-
-/**
- * Безопасный адрес используется для журналов.
- */
-const safeRtspUrl =
-  `rtsp://${encodedUsername}:***` + `@${host}:${port}${streamPath}`;
-
 module.exports = {
   ffmpegPath: process.env.FFMPEG_PATH?.trim() || 'ffmpeg',
 
   camera: {
-    host,
-    port,
-    username,
+    /** Полный адрес подключения к RTSP-потоку. */
     rtspUrl,
-    safeRtspUrl,
+
+    /** Адрес для журналирования без открытого пароля. */
+    safeRtspUrl: createSafeRtspUrl(rtspUrl),
+
+    /** RTSP-транспорт. Для локальной сети по умолчанию используется TCP. */
     transport,
   },
 
   frame: {
-    width: getPositiveInteger('FRAME_WIDTH'),
-    height: getPositiveInteger('FRAME_HEIGHT'),
-    fps: getPositiveInteger('FRAME_FPS'),
+    width: getPositiveInteger('FRAME_WIDTH', 1920),
+    height: getPositiveInteger('FRAME_HEIGHT', 1080),
+    fps: getPositiveInteger('FRAME_FPS', 25),
     channels: 3,
     pixelFormat: 'bgr24',
   },

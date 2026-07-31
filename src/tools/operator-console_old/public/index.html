@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tracking Operator Console</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>Tracking Operator Console</h1>
+      <p>Независимая проверка HTTP API ручного сопровождения</p>
+    </div>
+    <div class="connection">
+      <span id="connectionDot" class="status-dot status-dot--unknown"></span>
+      <span id="connectionText">Проверка соединения…</span>
+    </div>
+  </header>
+
+  <main class="app-layout">
+    <div class="main-row">
+      <section class="workspace panel">
+        <div class="toolbar">
+          <div class="mode-switch" role="group" aria-label="Режим выбора цели">
+            <button id="pointModeButton" class="button button--active">Выбор по координате</button>
+            <button id="idModeButton" class="button">Выбор по ID</button>
+          </div>
+
+          <label class="inline-control">
+            <input id="autoRefreshCheckbox" type="checkbox" checked>
+            Автообновление
+          </label>
+
+          <label class="inline-control">
+            Интервал
+            <select id="refreshIntervalSelect">
+              <option value="100">100 мс</option>
+              <option value="250">250 мс</option>
+              <option value="500" selected>500 мс</option>
+              <option value="1000">1000 мс</option>
+            </select>
+          </label>
+        </div>
+
+        <div id="canvasContainer" class="canvas-container">
+          <canvas id="trackingCanvas" width="1920" height="1080"></canvas>
+          <div class="canvas-hint" id="canvasHint">Щёлкните по кадру, чтобы передать координату</div>
+        </div>
+
+        <div class="canvas-footer">
+          <span id="frameSizeText">Кадр: —</span>
+          <span id="pointerText">Координата: —</span>
+          <span id="objectCountText">Объектов: 0</span>
+        </div>
+      </section>
+
+      <aside class="sidebar">
+        <section class="panel controls-panel">
+          <h2>Tracking API</h2>
+          <div class="api-address" id="apiAddress">—</div>
+
+          <div class="button-grid">
+            <button id="objectsButton" class="button">Объекты</button>
+            <button id="statusButton" class="button">Статус</button>
+            <button id="enableButton" class="button button--success">Включить</button>
+            <button id="disableButton" class="button button--danger">Выключить</button>
+            <button id="resetButton" class="button button--warning button--wide">Сбросить цель</button>
+          </div>
+        </section>
+
+        <section class="panel status-panel">
+          <h2>Диагностика</h2>
+          <dl class="status-list">
+            <div><dt>Состояние</dt><dd id="trackingState">—</dd></div>
+            <div><dt>Цель</dt><dd id="targetId">—</dd></div>
+            <div><dt>Трекер</dt><dd id="trackerType">—</dd></div>
+            <div><dt>Модуль</dt><dd id="trackingEnabled">—</dd></div>
+            <div><dt>Режим</dt><dd id="selectionMode">POINT</dd></div>
+            <div><dt>Объектов</dt><dd id="diagnosticObjectCount">0</dd></div>
+            <div><dt>Задержка</dt><dd id="apiLatency">—</dd></div>
+            <div><dt>Обновлено</dt><dd id="lastUpdatedAt">—</dd></div>
+            <div><dt>HTTP</dt><dd id="lastStatusCode">—</dd></div>
+          </dl>
+        </section>
+      </aside>
+    </div>
+
+    <section class="bottom-panel panel">
+      <div class="bottom-tabs" role="tablist" aria-label="Диагностические данные">
+        <button class="bottom-tab bottom-tab--active" data-bottom-tab="status">Status JSON</button>
+        <button class="bottom-tab" data-bottom-tab="objects">Objects JSON</button>
+        <button class="bottom-tab" data-bottom-tab="response">Last response</button>
+        <button class="bottom-tab" data-bottom-tab="log">Журнал запросов</button>
+        <div class="bottom-actions">
+          <button id="copyJsonButton" class="button button--small">Копировать JSON</button>
+          <button id="clearLogButton" class="button button--small">Очистить журнал</button>
+        </div>
+      </div>
+
+      <div class="bottom-content">
+        <pre id="rawJson" class="json-view bottom-view">{}</pre>
+        <div id="requestLog" class="request-log bottom-view bottom-view--hidden"></div>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

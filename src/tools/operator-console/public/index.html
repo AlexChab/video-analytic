@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operator Console v2</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <strong>OPERATOR CONSOLE</strong>
+      <span>Видеоаналитика и сопровождение цели</span>
+    </div>
+
+    <div id="intelligenceRibbon" class="intelligence-ribbon" aria-live="polite"></div>
+
+    <div class="connection">
+      <span id="connectionDot" class="status-dot status-dot--unknown"></span>
+      <span id="connectionText">Проверка соединения…</span>
+    </div>
+  </header>
+
+  <main class="console-layout">
+    <section class="video-panel panel">
+      <div id="modeBadge" class="mode-badge mode-badge--search">SEARCH</div>
+
+      <div id="canvasContainer" class="canvas-container">
+        <canvas id="trackingCanvas" width="1920" height="1080"></canvas>
+        <div id="canvasHint" class="canvas-hint">Выберите красную рамку одним щелчком</div>
+      </div>
+
+      <footer class="statusbar">
+        <span id="frameSizeText">Кадр: —</span>
+        <span id="pointerText">Координата: —</span>
+        <span id="objectCountText">Движение: 0</span>
+        <span id="apiLatency">API: —</span>
+        <span id="lastUpdatedAt">Обновлено: —</span>
+      </footer>
+    </section>
+
+    <aside class="right-panel panel">
+      <div class="right-panel__header">
+        <div>
+          <span class="eyebrow">РАБОЧАЯ ПАНЕЛЬ</span>
+          <h1 id="panelTitle">Поиск целей</h1>
+        </div>
+        <span id="panelMode" class="panel-mode">SEARCH</span>
+      </div>
+
+      <section id="searchPanel" class="mode-panel">
+        <div class="section-block">
+          <h2>Детектор</h2>
+          <dl class="data-list">
+            <div><dt>Обнаружений</dt><dd id="searchObjectCount">0</dd></div>
+            <div><dt>Tracking API</dt><dd id="trackingEnabled">—</dd></div>
+            <div><dt>Состояние</dt><dd id="trackingState">—</dd></div>
+          </dl>
+        </div>
+
+        <div class="section-block">
+          <h2>Обновление</h2>
+          <label class="switch-row">
+            <span>Автоматически</span>
+            <input id="autoRefreshCheckbox" type="checkbox" checked>
+          </label>
+          <label class="field-row">
+            <span>Интервал</span>
+            <select id="refreshIntervalSelect">
+              <option value="100">100 мс</option>
+              <option value="250">250 мс</option>
+              <option value="500" selected>500 мс</option>
+              <option value="1000">1000 мс</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="section-block">
+          <h2>Управление</h2>
+          <div class="button-grid">
+            <button id="enableButton" class="button button--success">Включить</button>
+            <button id="disableButton" class="button button--danger">Выключить</button>
+            <button id="refreshButton" class="button button--wide">Обновить данные</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="trackingPanel" class="mode-panel mode-panel--hidden">
+        <div class="target-card">
+          <div class="target-card__head">
+            <div>
+              <span class="eyebrow">АКТИВНАЯ ЦЕЛЬ</span>
+              <strong id="activeTargetLabel">T—</strong>
+            </div>
+            <span id="targetLifecycleState" class="lifecycle-state">TRACKING</span>
+          </div>
+
+          <dl class="data-list">
+            <div><dt>ID</dt><dd id="targetId">—</dd></div>
+            <div><dt>Координата</dt><dd id="targetCoordinates">—</dd></div>
+            <div><dt>Размер</dt><dd id="targetBoxSize">—</dd></div>
+            <div><dt>Трекер</dt><dd id="trackerType">—</dd></div>
+            <div><dt>В сопровождении</dt><dd id="trackingDuration">00:00</dd></div>
+          </dl>
+        </div>
+
+        <div class="section-block intelligence-block">
+          <div class="section-heading">
+            <h2>Автоматическое обогащение</h2>
+            <span id="intelligenceProgress">0 / 0</span>
+          </div>
+          <div id="sourceStateList" class="source-list"></div>
+        </div>
+
+        <button id="resetButton" class="button button--danger button--stop">Прекратить сопровождение</button>
+      </section>
+
+      <details class="diagnostics">
+        <summary>Инженерная диагностика</summary>
+        <div class="diagnostic-tabs">
+          <button class="diagnostic-tab diagnostic-tab--active" data-json-tab="status">Status</button>
+          <button class="diagnostic-tab" data-json-tab="objects">Objects</button>
+          <button class="diagnostic-tab" data-json-tab="target">Target</button>
+          <button class="diagnostic-tab" data-json-tab="response">Response</button>
+        </div>
+        <pre id="rawJson" class="json-view">{}</pre>
+        <div class="diagnostic-actions">
+          <button id="copyJsonButton" class="button button--small">Копировать JSON</button>
+          <button id="clearLogButton" class="button button--small">Очистить журнал</button>
+        </div>
+        <div id="requestLog" class="request-log"></div>
+      </details>
+    </aside>
+  </main>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

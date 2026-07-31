@@ -1,12 +1,15 @@
 'use strict';
 
+
+const logger = require('./utils/Logger');
 /**
  * Добавляем каталог с DLL OpenCV в PATH.
  *
  * Это необходимо сделать до подключения opencv4nodejs,
  * чтобы Windows смогла найти opencv_world4100.dll
  * и другие динамические библиотеки OpenCV.
- */
+ **/
+
 /**
  * Отключаем внутренний учёт внешней памяти cv.Mat.
  *
@@ -17,23 +20,24 @@
  *
  * Check failed: marking_done_
  */
+
 process.env.PATH =
   'C:\\project\\opencv\\install-contrib\\x64\\vc17\\bin;' + process.env.PATH;
 process.env.OPENCV4NODEJS_DISABLE_EXTERNAL_MEM_TRACKING = '1';
 
 const fs = require('node:fs');
 const path = require('node:path');
-
 const cv = require('@u4/opencv4nodejs');
-
 const config = require('./config/camera.config');
-
+const trackingConfig = require('./config/tracking.config');
+const ProfileManager = require('./config/ProfileManager');
 const RtspReader = require('./video/RtspReader');
 const FrameParser = require('./video/FrameParser');
-
 const FrameProcessor = require('./processing/FrameProcessor');
 const saveFrameAsJpeg = require('./utils/saveFrameAsJpeg');
 const LatestFrameBuffer = require('./video/LatestFrameBuffer');
+const ManualTrackingControl = require('./tracking/ManualTrackingControl');
+const TrackingApiServer = require('./api/TrackingApiServer');
 
 /**
  * Буфер хранит только последний полученный кадр.
@@ -42,6 +46,24 @@ const LatestFrameBuffer = require('./video/LatestFrameBuffer');
  * старые кадры автоматически заменяются новыми.
  */
 const latestFrameBuffer = new LatestFrameBuffer();
+
+/** Общее состояние команд ручного сопровождения. */
+const manualTrackingControl = new ManualTrackingControl();
+
+/**
+ * Единый менеджер конфигурации обработки.
+ * Он безопасно объединяет встроенные значения, motion.config.js,
+ * активный профиль и будущие runtime-переопределения.
+ */
+
+const profileManager = new ProfileManager();
+profileManager.initialize();
+
+// view method  profileManager
+
+// logger.info('\n===== ProfileManager =====');
+// logger.info(Object.getOwnPropertyNames(Object.getPrototypeOf(profileManager)));
+// logger.info('==========================\n');
 
 /**
  * Название окна предпросмотра.
@@ -52,7 +74,44 @@ const latestFrameBuffer = new LatestFrameBuffer();
  * - cv.getWindowProperty();
  * - cv.destroyWindow().
  */
-const previewWindowName = 'Video Analytics - CSRT / PTZ';
+const previewWindowName = 'Video Analytics - Motion Detection';
+/**
+ * Создаём окно заранее, чтобы оно было масштабируемым.
+ */
+if (typeof cv.namedWindow === 'function') {
+  cv.namedWindow(previewWindowName, cv.WINDOW_NORMAL);
+
+  if (typeof cv.resizeWindow === 'function') {
+    cv.resizeWindow(previewWindowName, 960, 540);
+  }
+}
+
+/**
+ * Время получения последнего куска данных от FFmpeg.
+ */
+let lastDataReceivedAt = Date.now();
+
+/**
+ * Время получения последнего полностью собранного видеокадра.
+ * В отличие от lastDataReceivedAt учитывает не просто байты stdout,
+ * а именно готовый кадр размером width × height × 3.
+ */
+let lastFrameReceivedAt = null;
+
+/**
+ * Таймер отложенного перезапуска FFmpeg.
+ */
+let readerRestartTimer = null;
+
+/**
+ * Защита от нескольких одновременных запросов перезапуска.
+ */
+let readerRestartScheduled = false;
+
+/**
+ * Причина последнего перезапуска FFmpeg.
+ */
+let lastRestartReason = 'нет';
 
 /**
  * Каталог для сохранения тестовых кадров.
@@ -158,6 +217,21 @@ const parser = new FrameParser({
 const frameProcessor = new FrameProcessor({
   width: config.frame.width,
   height: config.frame.height,
+
+  // Все режимы и параметры захвата находятся в одном файле:
+  // src/config/tracking.config.js
+  trackingConfig,
+  profileManager,
+  manualControl: manualTrackingControl,
+});
+/** HTTP API выбора цели по ID или координатам исходного RTSP-кадра. */
+const trackingApiServer = new TrackingApiServer({
+  host: trackingConfig.apiHost,
+  port: trackingConfig.apiPort,
+  control: manualTrackingControl,
+  profileManager,
+  frameWidth: config.frame.width,
+  frameHeight: config.frame.height,
 });
 
 /**
@@ -224,6 +298,55 @@ let previewWindowCreated = false;
  * за последнюю секунду, а не за всё время работы.
  */
 let previousDroppedFrames = 0;
+let previousParserDroppedFrames = 0;
+let previousStaleFramesDropped = 0;
+let previousFfmpegErrors = 0;
+
+/**
+ * Количество последних сообщений FFmpeg, сохраняемых для диагностики.
+ *
+ * FFmpeg пишет предупреждения и ошибки в stderr. При неожиданном завершении
+ * последние строки обычно содержат точную причину: разрыв RTSP, тайм-аут,
+ * повреждённый пакет, ошибка декодирования и т. п.
+ */
+const ffmpegLogHistoryLimit = 30;
+
+/** Последние диагностические сообщения FFmpeg. */
+const ffmpegLogHistory = [];
+
+/**
+ * Добавляет сообщение FFmpeg в кольцевой диагностический буфер.
+ *
+ * @param {string} message Сообщение из stderr FFmpeg.
+ */
+function rememberFfmpegLog(message) {
+  const normalizedMessage = String(message).trim();
+
+  if (!normalizedMessage) {
+    return;
+  }
+
+  ffmpegLogHistory.push(normalizedMessage);
+
+  if (ffmpegLogHistory.length > ffmpegLogHistoryLimit) {
+    ffmpegLogHistory.shift();
+  }
+}
+
+/** Выводит последние сообщения FFmpeg после аварийного завершения. */
+function printRecentFfmpegLogs() {
+  logger.error('========== Последние сообщения FFmpeg ==========');
+
+  if (ffmpegLogHistory.length === 0) {
+    logger.error('[FFmpeg] Диагностические сообщения отсутствуют.');
+  } else {
+    for (const message of ffmpegLogHistory) {
+      logger.error(`[FFmpeg] ${message}`);
+    }
+  }
+
+  logger.error('================================================');
+}
 /**
  * Передаём все бинарные данные FFmpeg
  * в парсер кадров.
@@ -232,7 +355,7 @@ reader.on('data', (chunk) => {
   if (shuttingDown) {
     return;
   }
-
+  lastDataReceivedAt = Date.now();
   parser.push(chunk);
 });
 
@@ -323,7 +446,7 @@ function closePreviewWindow(reason) {
 
   previewWindowCreated = false;
 
-  console.log(`[Видео] Окно предпросмотра закрыто: ${reason}.`);
+  logger.info(`[Видео] Окно предпросмотра закрыто: ${reason}.`);
 }
 
 /**
@@ -351,6 +474,24 @@ function showPreviewFrame(frame) {
       return 'continue';
     }
 
+    // test frame change
+
+    // frame.drawCircle(
+    //   new cv.Point2(
+    //     Math.floor(Math.random() * 500),
+    //     Math.floor(Math.random() * 300),
+    //   ),
+    //   4,
+    //   new cv.Vec3(0, 255, 255),
+    //   -1,
+    // );
+
+    // cv.imshow(previewWindowName, frame);
+
+    // previewWindowCreated = true;
+
+    // const pressedKey = cv.waitKey(1);
+
     cv.imshow(previewWindowName, frame);
 
     previewWindowCreated = true;
@@ -371,7 +512,7 @@ function showPreviewFrame(frame) {
      * включая RTSP, FFmpeg и видеоаналитику.
      */
     if (pressedKey === 27) {
-      console.log('[Видео] Нажата клавиша ESC.');
+      logger.info('[Видео] Нажата клавиша ESC.');
 
       return 'shutdown';
     }
@@ -395,7 +536,7 @@ function showPreviewFrame(frame) {
     previewWindowEnabled = false;
     previewWindowCreated = false;
 
-    console.warn('[Видео] Предпросмотр остановлен:', error.message);
+    logger.warn('[Видео] Предпросмотр остановлен:', error.message);
   }
 
   return 'continue';
@@ -431,7 +572,7 @@ function showPreviewFrame(frame) {
 //     try {
 //       processingResult = frameProcessor.process(frameBuffer, metadata);
 //     } catch (error) {
-//       console.error(
+//       logger.error(
 //         `[OpenCV] Ошибка обработки кадра ` + `${metadata.number}:`,
 //         error.message,
 //       );
@@ -476,11 +617,11 @@ function showPreviewFrame(frame) {
 
 //         firstFrameSaved = true;
 
-//         console.log(
+//         logger.info(
 //           '[Видео] Кадр с захваченной целью ' + `сохранён: ${testFramePath}`,
 //         );
 //       } catch (error) {
-//         console.error('[Видео] Ошибка сохранения кадра:', error.message);
+//         logger.error('[Видео] Ошибка сохранения кадра:', error.message);
 //       } finally {
 //         savingFirstFrame = false;
 //       }
@@ -501,6 +642,7 @@ parser.on('frame', (frameBuffer, metadata) => {
 
   totalFrames += 1;
   framesSinceLastReport += 1;
+  lastFrameReceivedAt = Date.now();
   /**
    * Новый кадр заменяет предыдущий ожидающий кадр.
    *
@@ -562,7 +704,7 @@ async function processLatestFrame() {
         bufferedFrame.metadata,
       );
     } catch (error) {
-      console.error(
+      logger.error(
         '[OpenCV] Ошибка обработки кадра ' +
           `${bufferedFrame.metadata.number ?? 'неизвестно'}:`,
         error.message,
@@ -608,11 +750,11 @@ async function processLatestFrame() {
 
         firstFrameSaved = true;
 
-        console.log(
+        logger.info(
           '[Видео] Кадр с захваченной целью ' + `сохранён: ${testFramePath}`,
         );
       } catch (error) {
-        console.error('[Видео] Ошибка сохранения кадра:', error.message);
+        logger.error('[Видео] Ошибка сохранения кадра:', error.message);
       } finally {
         savingFirstFrame = false;
       }
@@ -630,52 +772,104 @@ async function processLatestFrame() {
  */
 processingTimer = setInterval(() => {
   processLatestFrame().catch((error) => {
-    console.error('[Видео] Ошибка цикла обработки:', error);
+    logger.error('[Видео] Ошибка цикла обработки:', error);
   });
 }, analyticsIntervalMs);
+
+/**
+ * Планирует безопасный перезапуск FFmpeg.
+ *
+ * Повторные запросы во время ожидания игнорируются, поэтому watchdog
+ * и событие close не могут создать несколько процессов одновременно.
+ *
+ * @param {string} reason Причина перезапуска.
+ */
+function scheduleReaderRestart(reason) {
+  if (shuttingDown || readerRestartScheduled) {
+    return;
+  }
+
+  readerRestartScheduled = true;
+  lastRestartReason = reason;
+
+  logger.warn(`[RTSP] Перезапуск FFmpeg через 2 сек. Причина: ${reason}.`);
+
+  try {
+    reader.stop();
+  } catch (error) {
+    logger.warn('[RTSP] Ошибка остановки перед перезапуском:', error.message);
+  }
+
+  readerRestartTimer = setTimeout(() => {
+    readerRestartTimer = null;
+
+    if (shuttingDown) {
+      readerRestartScheduled = false;
+      return;
+    }
+
+    try {
+      // Удаляем незавершённый хвост старого rawvideo-потока.
+      parser.reset();
+      previousParserDroppedFrames = 0;
+      latestFrameBuffer.clear();
+      lastDataReceivedAt = Date.now();
+      lastFrameReceivedAt = null;
+
+      reader.start();
+      readerRestartScheduled = false;
+    } catch (error) {
+      readerRestartScheduled = false;
+      logger.error('[RTSP] Не удалось перезапустить FFmpeg:', error.message);
+      scheduleReaderRestart('ошибка повторного запуска');
+    }
+  }, 2000);
+}
 
 /**
  * Обычные диагностические сообщения RTSP-модуля.
  */
 reader.on('log', (message) => {
-  console.log(`[RTSP] ${message}`);
+  logger.info(`[RTSP] ${message}`);
 });
 
 /**
  * Диагностические сообщения непосредственно от FFmpeg.
  */
 reader.on('ffmpegLog', (message) => {
-  console.warn(`[FFmpeg] ${message}`);
+  rememberFfmpegLog(message);
+  logger.warn(`[FFmpeg] ${message}`);
 });
 
 /**
  * Ошибка запуска или работы RTSP/FFmpeg.
  */
 reader.on('error', (error) => {
-  console.error('[RTSP] Ошибка запуска FFmpeg:', error.message);
+  logger.error('[RTSP] Ошибка запуска FFmpeg:', error.message);
 });
 
 /**
  * Обрабатываем завершение дочернего процесса FFmpeg.
  */
 reader.on('close', ({ code, signal, expected }) => {
-  if (expected) {
-    console.log('[RTSP] FFmpeg остановлен');
-
+  if (shuttingDown) {
     return;
   }
 
-  console.error(
+  if (expected) {
+    logger.info('[RTSP] FFmpeg остановлен');
+    return;
+  }
+
+  logger.error(
     '[RTSP] FFmpeg неожиданно завершился. ' +
-      `Код: ${code}, ` +
+      `Код: ${code ?? 'не указан'}, ` +
       `сигнал: ${signal || 'нет'}`,
   );
 
-  /**
-   * Если FFmpeg завершился неожиданно,
-   * приложение больше не сможет получать кадры.
-   */
-  shutdown('FFmpeg close');
+  printRecentFfmpegLogs();
+
+  scheduleReaderRestart('неожиданное завершение FFmpeg');
 });
 
 /**
@@ -683,26 +877,66 @@ reader.on('close', ({ code, signal, expected }) => {
  * обработанных кадров.
  */
 const fpsTimer = setInterval(() => {
+  const now = Date.now();
   const bufferStats = latestFrameBuffer.getStats();
+  const parserStats = parser.getStats();
+  const readerStats = reader.getStats();
   const performanceStats = frameProcessor.getPerformanceStats();
 
-  const droppedDuringSecond = bufferStats.droppedFrames - previousDroppedFrames;
+  const bufferDroppedDuringSecond =
+    bufferStats.droppedFrames - previousDroppedFrames;
+  const parserDroppedDuringSecond =
+    parserStats.droppedFrames - previousParserDroppedFrames;
+  const staleDroppedDuringSecond =
+    staleFramesDropped - previousStaleFramesDropped;
+  const ffmpegErrorsDuringSecond =
+    readerStats.ffmpegErrors - previousFfmpegErrors;
 
   previousDroppedFrames = bufferStats.droppedFrames;
+  previousParserDroppedFrames = parserStats.droppedFrames;
+  previousStaleFramesDropped = staleFramesDropped;
+  previousFfmpegErrors = readerStats.ffmpegErrors;
 
-  console.log(
-    `[Видео] вход=${framesSinceLastReport} FPS, ` +
-      `обработано=${processedFramesSinceLastReport} FPS, ` +
-      `пропущено=${droppedDuringSecond} FPS, ` +
-      `просрочено=${staleFramesDropped}, ` +
-      `всего входных=${totalFrames}`,
+  const totalDroppedDuringSecond =
+    bufferDroppedDuringSecond +
+    parserDroppedDuringSecond +
+    staleDroppedDuringSecond;
+
+  const lastFrameAgeMs =
+    lastFrameReceivedAt === null ? null : now - lastFrameReceivedAt;
+
+  const lastFrameText =
+    lastFrameAgeMs === null ? 'ещё не получен' : `${lastFrameAgeMs} мс назад`;
+
+  const restartCount = Math.max(0, readerStats.starts - 1);
+
+  logger.info(
+    '[Статистика] ' +
+      `вход=${framesSinceLastReport} FPS; ` +
+      `аналитика=${processedFramesSinceLastReport} FPS; ` +
+      `пропущено=${totalDroppedDuringSecond}/с ` +
+      `(parser=${parserDroppedDuringSecond}, ` +
+      `buffer=${bufferDroppedDuringSecond}, ` +
+      `stale=${staleDroppedDuringSecond}); ` +
+      `ошибки FFmpeg=${ffmpegErrorsDuringSecond}/с; ` +
+      `последний кадр=${lastFrameText}; ` +
+      `перезапуски=${restartCount}`,
   );
-  /**
-   * Форматирует один этап профилирования.
-   *
-   * averageMs показывает обычное время,
-   * maxMs помогает увидеть кратковременные зависания.
-   */
+
+  logger.info(
+    '[Статистика всего] ' +
+      `кадров=${totalFrames}; ` +
+      `обработано=${bufferStats.consumedFrames}; ` +
+      `parser drop=${parserStats.droppedFrames}; ` +
+      `buffer drop=${bufferStats.droppedFrames}; ` +
+      `stale drop=${staleFramesDropped}; ` +
+      `FFmpeg errors=${readerStats.ffmpegErrors}; ` +
+      `получено=${(readerStats.receivedBytes / 1024 / 1024).toFixed(1)} МБ; ` +
+      `состояние=${readerStats.running ? 'работает' : 'остановлен'}; ` +
+      `последний restart=${lastRestartReason}`,
+  );
+
+  /** Форматирует один этап профилирования. */
   const formatMetric = (name) => {
     const metric = performanceStats[name];
 
@@ -717,34 +951,37 @@ const fpsTimer = setInterval(() => {
     );
   };
 
-  console.log('[Профайлер] ' + `весь кадр: ${formatMetric('total')}`);
-
-  console.log(
+  logger.info(
     '[Профайлер] ' +
-      `MotionDetector: ${formatMetric('motionDetector')}; ` +
-      `TargetSelector: ${formatMetric('targetSelector')}`,
-  );
-
-  console.log(
-    '[Профайлер] ' +
-      `CSRT start: ${formatMetric('trackerStart')}; ` +
-      `CSRT update: ${formatMetric('trackerUpdate')}`,
-  );
-
-  console.log(
-    '[Профайлер] ' +
-      `PTZ calculate: ${formatMetric('ptzCalculate')}; ` +
-      `PTZ execute: ${formatMetric('ptzExecute')}`,
-  );
-
-  console.log(
-    '[Профайлер] ' +
-      `Renderer: ${formatMetric('renderer')}; ` +
-      `копирование Buffer: ${formatMetric('frameBufferCopy')}`,
+      `кадр=${formatMetric('total')}; ` +
+      `MotionDetector=${formatMetric('motionDetector')}; ` +
+      `Renderer=${formatMetric('renderer')}`,
   );
 
   framesSinceLastReport = 0;
   processedFramesSinceLastReport = 0;
+}, 1000);
+
+/**
+ * Контроль поступления видеопотока.
+ *
+ * Если более 5 секунд не приходит ни одного байта
+ * от FFmpeg, считаем, что поток потерян.
+ */
+const streamWatchdog = setInterval(() => {
+  if (shuttingDown) {
+    return;
+  }
+
+  const elapsed = Date.now() - lastDataReceivedAt;
+
+  if (elapsed > 5000) {
+    logger.error(
+      `[RTSP] Ошибка: видеопоток отсутствует уже ${Math.round(elapsed / 1000)} сек.`,
+    );
+
+    scheduleReaderRestart(`нет данных ${Math.round(elapsed / 1000)} сек.`);
+  }
 }, 1000);
 
 /**
@@ -767,14 +1004,21 @@ function shutdown(signal) {
   }
 
   shuttingDown = true;
+  trackingApiServer.stop();
   previewWindowEnabled = false;
 
-  console.log(`\nПолучен сигнал ${signal}. ` + 'Завершение работы...');
+  logger.info(`\nПолучен сигнал ${signal}. ` + 'Завершение работы...');
 
   /**
    * Останавливаем периодический вывод FPS.
    */
   clearInterval(fpsTimer);
+
+  if (readerRestartTimer !== null) {
+    clearTimeout(readerRestartTimer);
+    readerRestartTimer = null;
+  }
+  readerRestartScheduled = false;
 
   /**
    * Сначала закрываем конкретное окно предпросмотра.
@@ -784,7 +1028,7 @@ function shutdown(signal) {
       cv.destroyWindow(previewWindowName);
     }
   } catch (error) {
-    console.warn('[Видео] Ошибка закрытия окна:', error.message);
+    logger.warn('[Видео] Ошибка закрытия окна:', error.message);
   }
 
   /**
@@ -796,7 +1040,7 @@ function shutdown(signal) {
       cv.destroyAllWindows();
     }
   } catch (error) {
-    console.warn('[Видео] Ошибка destroyAllWindows():', error.message);
+    logger.warn('[Видео] Ошибка destroyAllWindows():', error.message);
   }
 
   /**
@@ -823,7 +1067,7 @@ function shutdown(signal) {
       frameProcessor.reset();
     }
   } catch (error) {
-    console.warn('[OpenCV] Ошибка сброса аналитики:', error.message);
+    logger.warn('[OpenCV] Ошибка сброса аналитики:', error.message);
   }
 
   /**
@@ -832,7 +1076,7 @@ function shutdown(signal) {
   try {
     reader.stop();
   } catch (error) {
-    console.warn('[RTSP] Ошибка остановки FFmpeg:', error.message);
+    logger.warn('[RTSP] Ошибка остановки FFmpeg:', error.message);
   }
 
   /**
@@ -848,6 +1092,9 @@ function shutdown(signal) {
    */
   latestFrameBuffer.clear();
 
+  /** Останавливаем таймер контроля потока  */
+  clearInterval(streamWatchdog);
+
   /**
    * Даём FFmpeg время на корректное завершение.
    *
@@ -855,8 +1102,7 @@ function shutdown(signal) {
    * удерживать Node.js, процесс будет завершён принудительно.
    */
   const forceExitTimer = setTimeout(() => {
-    console.log('[Система] Работа завершена.');
-
+    logger.info('[Система] Работа завершена.');
     process.exit(0);
   }, 2000);
 
@@ -882,7 +1128,7 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
  * чтобы успеть остановить FFmpeg и закрыть окно.
  */
 process.on('uncaughtException', (error) => {
-  console.error('Необработанная ошибка:', error);
+  logger.error('Необработанная ошибка:', error);
 
   shutdown('uncaughtException');
 });
@@ -891,7 +1137,7 @@ process.on('uncaughtException', (error) => {
  * Перехватываем необработанные отклонения Promise.
  */
 process.on('unhandledRejection', (error) => {
-  console.error('Необработанное отклонение Promise:', error);
+  logger.error('Необработанное отклонение Promise:', error);
 
   shutdown('unhandledRejection');
 });
@@ -899,20 +1145,20 @@ process.on('unhandledRejection', (error) => {
 /**
  * Начальная диагностическая информация.
  */
-console.log('Запуск захвата видеопотока...');
+logger.info('Запуск захвата видеопотока...');
 
-console.log(
+logger.info(
   `Выходной формат: ` +
     `${config.frame.width}x` +
     `${config.frame.height}, ` +
     `${config.frame.pixelFormat}`,
 );
 
-console.log(`Ожидаемый FPS камеры: ` + `${config.frame.fps}`);
+logger.info(`Ожидаемый FPS камеры: ` + `${config.frame.fps}`);
 
-console.log(`Размер одного кадра: ` + `${parser.frameSize} байт`);
+logger.info(`Размер одного кадра: ` + `${parser.frameSize} байт`);
 
-console.log(
+logger.info(
   '[Видео] Управление: ' +
     'ESC — завершение приложения, ' +
     'крестик — закрытие окна предпросмотра.',
@@ -921,4 +1167,5 @@ console.log(
 /**
  * Запускаем FFmpeg и получение RTSP-потока.
  */
+trackingApiServer.start();
 reader.start();

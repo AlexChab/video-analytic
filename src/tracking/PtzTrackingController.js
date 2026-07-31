@@ -1,3 +1,4 @@
+const logger = require('../utils/Logger');
 /**
  * Контроллер автоматического сопровождения объекта PTZ-камерой.
  *
@@ -141,7 +142,7 @@ class PtzTrackingController {
     this.targetCenter = this.getDetectionCenter(candidate);
     this.lostFrames = 0;
 
-    console.log(
+    logger.info(
       '[Трекинг] Цель захвачена: ' +
         `x=${Math.round(this.targetCenter.x)}, ` +
         `y=${Math.round(this.targetCenter.y)}, ` +
@@ -171,7 +172,7 @@ class PtzTrackingController {
       });
 
       if (this.lostFrames >= this.lostFrameLimit) {
-        console.log(
+        logger.info(
           '[Трекинг] Цель потеряна окончательно. Возвращаемся к поиску.',
         );
 
@@ -182,7 +183,7 @@ class PtzTrackingController {
     }
 
     if (this.state === 'LOST') {
-      console.log('[Трекинг] Цель снова обнаружена.');
+      logger.info('[Трекинг] Цель снова обнаружена.');
     }
 
     this.state = 'TRACKING';
@@ -325,7 +326,7 @@ class PtzTrackingController {
       parts.push(`причина="${metadata.reason}"`);
     }
 
-    console.log(parts.join(', '));
+    logger.info(parts.join(', '));
 
     this.lastCommand = commandKey;
     this.lastCommandTime = currentTime;

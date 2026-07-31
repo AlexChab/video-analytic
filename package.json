@@ -8,7 +8,8 @@
     "start": "set \"PATH=C:\\project\\opencv\\install-contrib\\x64\\vc17\\bin;%PATH%\" && node src/app.js",
     "dev": "set \"PATH=C:\\project\\opencv\\install-contrib\\x64\\vc17\\bin;%PATH%\" && node --watch src/app.js",
     "test:csrt": "set \"PATH=C:\\project\\opencv\\install-contrib\\x64\\vc17\\bin;%PATH%\" && node tests/csrtSmokeTest.js",
-    "test:tracker": "set \"PATH=C:\\project\\opencv\\install-contrib\\x64\\vc17\\bin;%PATH%\" && node tests/objectTrackerTest.js"
+    "test:tracker": "set \"PATH=C:\\project\\opencv\\install-contrib\\x64\\vc17\\bin;%PATH%\" && node tests/objectTrackerTest.js",
+    "build": "electron-builder"
   },
   "keywords": [],
   "author": "Olders-Alex",

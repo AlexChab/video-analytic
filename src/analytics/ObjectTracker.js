@@ -1,5 +1,7 @@
 'use strict';
 
+
+const logger = require('../utils/Logger');
 const cv = require('@u4/opencv4nodejs');
 
 /**
@@ -615,7 +617,7 @@ class ObjectTracker {
    */
   #log(...args) {
     if (this.debug) {
-      console.log('[ObjectTracker]', ...args);
+      logger.info('[ObjectTracker]', ...args);
     }
   }
 }

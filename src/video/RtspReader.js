@@ -1,23 +1,29 @@
+'use strict';
+
 const { EventEmitter } = require('node:events');
 const { spawn } = require('node:child_process');
 
 /**
- * RtspReader запускает FFmpeg и преобразует RTSP-поток камеры
- * в непрерывный поток сырых кадров BGR24.
+ * Запускает FFmpeg для чтения RTSP-потока и передаёт в Node.js
+ * непрерывный поток кадров BGR24 через stdout.
  *
- * Класс пока не разделяет данные на отдельные кадры.
- * Этим занимается FrameParser.
+ * Класс также собирает транспортную статистику:
+ *
+ * - число запусков FFmpeg;
+ * - объём и количество полученных блоков данных;
+ * - предупреждения и ошибки FFmpeg;
+ * - число неожиданных завершений процесса.
  */
 class RtspReader extends EventEmitter {
   /**
    * @param {object} options
    * @param {string} options.ffmpegPath Путь к FFmpeg.
-   * @param {string} options.rtspUrl Полный RTSP URL с авторизацией.
-   * @param {string} options.safeRtspUrl URL без пароля для журналов.
+   * @param {string} options.rtspUrl Полный RTSP URL, с авторизацией или без неё.
+   * @param {string} options.safeRtspUrl RTSP URL без открытого пароля.
    * @param {'tcp'|'udp'} options.transport RTSP-транспорт.
    * @param {number} options.width Ширина выходного кадра.
    * @param {number} options.height Высота выходного кадра.
-   * @param {number} options.fps Ожидаемая частота кадров.
+   * @param {number} options.fps Ожидаемая частота кадров камеры.
    */
   constructor(options) {
     super();
@@ -30,18 +36,24 @@ class RtspReader extends EventEmitter {
     this.height = options.height;
     this.fps = options.fps;
 
-    /**
-     * Ссылка на дочерний процесс FFmpeg.
-     *
-     * @type {import('node:child_process').ChildProcessWithoutNullStreams|null}
-     */
+    /** @type {import('node:child_process').ChildProcessWithoutNullStreams|null} */
     this.process = null;
-
     this.stopping = false;
+
+    this.stats = {
+      starts: 0,
+      unexpectedCloses: 0,
+      receivedChunks: 0,
+      receivedBytes: 0,
+      ffmpegWarnings: 0,
+      ffmpegErrors: 0,
+      lastDataAt: null,
+      startedAt: null,
+    };
   }
 
   /**
-   * Запускает подключение к RTSP-камере.
+   * Запускает FFmpeg.
    */
   start() {
     if (this.process) {
@@ -49,146 +61,78 @@ class RtspReader extends EventEmitter {
     }
 
     this.stopping = false;
+    this.stats.starts += 1;
+    this.stats.startedAt = Date.now();
 
+    /**
+     * Параметры рассчитаны именно на RTSP-камеру.
+     * TCP выбран как наиболее устойчивый транспорт для видеонаблюдения.
+     */
     const args = [
       '-hide_banner',
-
-      // Предупреждения и ошибки FFmpeg будут поступать через stderr.
       '-loglevel',
       'warning',
 
-      // Для сетей видеонаблюдения TCP обычно стабильнее UDP.
       '-rtsp_transport',
       this.transport,
 
-      // Входной RTSP-поток.
+      /**
+       * Используем время прихода RTSP-пакетов как резервные временные метки.
+       * Это особенно важно для камер, которые передают некорректные или
+       * постоянно повторяющиеся PTS/DTS.
+       */
+      '-use_wallclock_as_timestamps',
+      '1',
+
+      /**
+       * Генерируем отсутствующие PTS и отбрасываем повреждённые пакеты.
+       * В отличие от `nobuffer`, этот режим не ломает очередь декодера,
+       * необходимую некоторым H.264/H.265-потокам.
+       */
+      '-fflags',
+      '+genpts+discardcorrupt',
+
+      // Даём FFmpeg достаточно данных для корректного определения потока.
+      '-probesize',
+      '1000000',
+      '-analyzeduration',
+      '1000000',
+
       '-i',
       this.rtspUrl,
 
-      // Аудио на текущем этапе не требуется.
+      // Аналитике нужен только первый видеопоток.
+      '-map',
+      '0:v:0',
       '-an',
+      '-sn',
+      '-dn',
 
-      // Приводим поток к фиксированному разрешению.
-      // Это гарантирует постоянный размер каждого кадра.
+      // Сохраняем фиксированный размер кадра для FrameParser.
       '-vf',
       `scale=${this.width}:${this.height}`,
 
-      // Выдаем трехканальный BGR, удобный для OpenCV.
+      /**
+       * Не разрешаем FFmpeg искусственно дублировать кадры для выравнивания
+       * временной шкалы. Каждый rawvideo-кадр должен соответствовать реально
+       * декодированному кадру камеры.
+       *
+       * `-fps_mode passthrough` — современная замена `-vsync 0`.
+       */
+      '-fps_mode',
+      'passthrough',
+
       '-pix_fmt',
       'bgr24',
-
-      // Формат вывода — необработанные кадры без контейнера.
       '-f',
       'rawvideo',
-
-      // Записываем кадры в stdout дочернего процесса.
       'pipe:1',
     ];
 
-    // const args = [
-    //   /**
-    //    * Не выводим лишнюю служебную информацию.
-    //    */
-    //   '-hide_banner',
-    //   '-loglevel',
-    //   'warning',
-
-    //   /**
-    //    * RTSP-транспорт.
-    //    *
-    //    * tcp надёжнее, но при потерях может увеличивать задержку.
-    //    * Сначала оставляем транспорт из конфигурации.
-    //    */
-    //   '-rtsp_transport',
-    //   this.transport,
-
-    //   /**
-    //    * Не накапливаем пакеты на этапе анализа входного потока.
-    //    */
-    //   '-fflags',
-    //   'nobuffer',
-
-    //   /**
-    //    * Просим декодер работать с минимальной задержкой.
-    //    */
-    //   '-flags',
-    //   'low_delay',
-
-    //   /**
-    //    * Сильно уменьшаем объём данных,
-    //    * используемых FFmpeg для определения формата потока.
-    //    *
-    //    * Значение по умолчанию значительно больше.
-    //    */
-    //   '-probesize',
-    //   '32768',
-
-    //   /**
-    //    * Сокращаем время анализа потока.
-    //    *
-    //    * Значение указывается в микросекундах:
-    //    * 100000 = 100 мс.
-    //    */
-    //   '-analyzeduration',
-    //   '100000',
-
-    //   /**
-    //    * Минимальная задержка демультиплексора.
-    //    */
-    //   '-max_delay',
-    //   '0',
-
-    //   /**
-    //    * Уменьшаем очередь переупорядочивания RTSP-пакетов.
-    //    *
-    //    * Для TCP можно использовать 0.
-    //    * При UDP это повышает риск артефактов при перестановке пакетов.
-    //    */
-    //   '-reorder_queue_size',
-    //   '0',
-
-    //   /**
-    //    * Берём только видеопоток.
-    //    * Аудио для аналитики не требуется.
-    //    */
-    //   '-an',
-    //   '-sn',
-    //   '-dn',
-
-    //   /**
-    //    * RTSP-источник.
-    //    *
-    //    * Все входные параметры должны располагаться до -i.
-    //    */
-    //   '-i',
-    //   this.rtspUrl,
-
-    //   /**
-    //    * Не синхронизируем выход по временным меткам входного потока.
-    //    *
-    //    * FFmpeg должен отдавать декодированные кадры сразу,
-    //    * а не пытаться выдерживать исходный график PTS.
-    //    */
-    //   '-vsync',
-    //   '0',
-
-    //   /**
-    //    * Не изменяем частоту кадров через фильтр fps.
-    //    *
-    //    * Управление частотой аналитики выполняется уже в Node.js.
-    //    */
-    //   '-pix_fmt',
-    //   'bgr24',
-
-    //   /**
-    //    * Передаём несжатые кадры через stdout.
-    //    */
-    //   '-f',
-    //   'rawvideo',
-    //   'pipe:1',
-    // ];
-
-    this.emit('log', `Запуск FFmpeg. Источник: ${this.safeRtspUrl}`);
+    this.emit(
+      'log',
+      `Запуск FFmpeg №${this.stats.starts}. Источник: ${this.safeRtspUrl}`,
+    );
 
     this.process = spawn(this.ffmpegPath, args, {
       shell: false,
@@ -196,20 +140,32 @@ class RtspReader extends EventEmitter {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    /**
-     * stdout содержит только бинарные данные кадров.
-     */
     this.process.stdout.on('data', (chunk) => {
+      this.stats.receivedChunks += 1;
+      this.stats.receivedBytes += chunk.length;
+      this.stats.lastDataAt = Date.now();
+
       this.emit('data', chunk);
     });
 
-    /**
-     * stderr содержит диагностические сообщения FFmpeg.
-     */
     this.process.stderr.on('data', (chunk) => {
-      const message = chunk.toString('utf8').trim();
+      const messages = chunk
+        .toString('utf8')
+        .split(/\r?\n/)
+        .map((message) => message.trim())
+        .filter(Boolean);
 
-      if (message) {
+      for (const message of messages) {
+        const isError = /error|invalid|corrupt|failed|missing|timeout/i.test(
+          message,
+        );
+
+        if (isError) {
+          this.stats.ffmpegErrors += 1;
+        } else {
+          this.stats.ffmpegWarnings += 1;
+        }
+
         this.emit('ffmpegLog', message);
       }
     });
@@ -224,6 +180,10 @@ class RtspReader extends EventEmitter {
       this.process = null;
       this.stopping = false;
 
+      if (!wasStopping) {
+        this.stats.unexpectedCloses += 1;
+      }
+
       this.emit('close', {
         code,
         signal,
@@ -233,7 +193,7 @@ class RtspReader extends EventEmitter {
   }
 
   /**
-   * Останавливает FFmpeg.
+   * Останавливает текущий процесс FFmpeg.
    */
   stop() {
     if (!this.process) {
@@ -241,12 +201,17 @@ class RtspReader extends EventEmitter {
     }
 
     this.stopping = true;
-
-    /**
-     * SIGTERM корректно обрабатывается FFmpeg и дает ему возможность
-     * завершить работу без аварийного обрыва.
-     */
     this.process.kill('SIGTERM');
+  }
+
+  /**
+   * Возвращает копию накопленной транспортной статистики.
+   */
+  getStats() {
+    return {
+      ...this.stats,
+      running: this.process !== null,
+    };
   }
 }
 
