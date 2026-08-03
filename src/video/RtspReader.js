@@ -24,6 +24,7 @@ class RtspReader extends EventEmitter {
    * @param {number} options.width Ширина выходного кадра.
    * @param {number} options.height Высота выходного кадра.
    * @param {number} options.fps Ожидаемая частота кадров камеры.
+   * @param {number} options.outputFps Частота кадров rawvideo для Node.js.
    */
   constructor(options) {
     super();
@@ -35,6 +36,7 @@ class RtspReader extends EventEmitter {
     this.width = options.width;
     this.height = options.height;
     this.fps = options.fps;
+    this.outputFps = options.outputFps ?? options.fps;
 
     /** @type {import('node:child_process').ChildProcessWithoutNullStreams|null} */
     this.process = null;
@@ -108,9 +110,16 @@ class RtspReader extends EventEmitter {
       '-sn',
       '-dn',
 
-      // Сохраняем фиксированный размер кадра для FrameParser.
+      /**
+       * Ограничиваем частоту rawvideo до передачи в Node.js.
+       *
+       * Камера может выдавать 25–30 FPS, но аналитика обрабатывает
+       * существенно меньше. Без этого ограничения через stdout проходит
+       * до 180 МБ/с для Full HD BGR24, что создаёт лишнюю нагрузку на
+       * копирование Buffer и сборку кадров.
+       */
       '-vf',
-      `scale=${this.width}:${this.height}`,
+      `fps=${this.outputFps},scale=${this.width}:${this.height}`,
 
       /**
        * Не разрешаем FFmpeg искусственно дублировать кадры для выравнивания

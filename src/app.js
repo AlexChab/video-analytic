@@ -38,6 +38,10 @@ const saveFrameAsJpeg = require('./utils/saveFrameAsJpeg');
 const LatestFrameBuffer = require('./video/LatestFrameBuffer');
 const ManualTrackingControl = require('./tracking/ManualTrackingControl');
 const TrackingApiServer = require('./api/TrackingApiServer');
+const camerasConfig = require('./config/cameras.config');
+const CameraRegistry = require('./camera/CameraRegistry');
+const CameraDriverFactory = require('./camera/CameraDriverFactory');
+const CameraCommandDispatcher = require('./camera/CameraCommandDispatcher');
 
 /**
  * Буфер хранит только последний полученный кадр.
@@ -49,6 +53,31 @@ const latestFrameBuffer = new LatestFrameBuffer();
 
 /** Общее состояние команд ручного сопровождения. */
 const manualTrackingControl = new ManualTrackingControl();
+
+/** Реестр связывает физическую камеру, RTSP-поток и драйвер управления. */
+const cameraRegistry = new CameraRegistry(camerasConfig);
+const activeCameraBinding = cameraRegistry.getActiveBinding();
+const activeCameraControl = activeCameraBinding.device.control ?? {};
+
+/**
+ * На первом этапе используется безопасный ConsoleCameraDriver.
+ * Для реальной камеры меняется только CAMERA_CONTROL_DRIVER и реализация драйвера.
+ */
+const cameraDriver = CameraDriverFactory.create(
+  activeCameraControl.enabled === false ? 'console' : activeCameraControl.driver,
+  activeCameraControl.options ?? {},
+);
+const cameraCommandDispatcher = new CameraCommandDispatcher({
+  driver: cameraDriver,
+  ...(activeCameraControl.dispatcher ?? {}),
+});
+cameraCommandDispatcher.start();
+logger.info(
+  `[CAMERA] Активная камера=${activeCameraBinding.device.id}; ` +
+  `поток=${activeCameraBinding.stream.id}; ` +
+  `управление=${activeCameraControl.enabled === false ? 'выключено' : 'включено'}; ` +
+  `driver=${cameraDriver.constructor.name}`,
+);
 
 /**
  * Единый менеджер конфигурации обработки.
@@ -130,7 +159,7 @@ const testFramePath = path.join(outputDirectory, 'first-frame.jpg');
  * CSRT обычно нет необходимости обновлять с частотой 25–30 FPS.
  * Для начала используем 10 кадров в секунду.
  */
-const analyticsFps = 10;
+const analyticsFps = config.frame.outputFps;
 
 /**
  * Минимальный интервал между запусками обработки.
@@ -181,7 +210,7 @@ fs.mkdirSync(outputDirectory, {
 const reader = new RtspReader({
   ffmpegPath: config.ffmpegPath,
 
-  rtspUrl: config.camera.rtspUrl,
+  rtspUrl: activeCameraBinding.stream.rtspUrl || config.camera.rtspUrl,
   safeRtspUrl: config.camera.safeRtspUrl,
 
   transport: config.camera.transport,
@@ -189,6 +218,7 @@ const reader = new RtspReader({
   width: config.frame.width,
   height: config.frame.height,
   fps: config.frame.fps,
+  outputFps: config.frame.outputFps,
 });
 
 /**
@@ -223,6 +253,8 @@ const frameProcessor = new FrameProcessor({
   trackingConfig,
   profileManager,
   manualControl: manualTrackingControl,
+  cameraCommandDispatcher,
+  cameraControlConfig: activeCameraControl.axes ?? {},
 });
 /** HTTP API выбора цели по ID или координатам исходного RTSP-кадра. */
 const trackingApiServer = new TrackingApiServer({
@@ -955,7 +987,14 @@ const fpsTimer = setInterval(() => {
     '[Профайлер] ' +
       `кадр=${formatMetric('total')}; ` +
       `MotionDetector=${formatMetric('motionDetector')}; ` +
-      `Renderer=${formatMetric('renderer')}`,
+      `Stabilizer=${formatMetric('detectionStabilizer')}; ` +
+      `ObjectId=${formatMetric('objectIdManager')}; ` +
+      `Tracker=${formatMetric('trackerUpdate')}; ` +
+      `PTZ calc=${formatMetric('ptzCalculate')}; ` +
+      `PTZ execute=${formatMetric('ptzExecute')}; ` +
+      `Status=${formatMetric('manualStatus')}; ` +
+      `Renderer=${formatMetric('renderer')}; ` +
+      `Buffer copy=${formatMetric('frameBufferCopy')}`,
   );
 
   framesSinceLastReport = 0;
@@ -1071,6 +1110,14 @@ function shutdown(signal) {
   }
 
   /**
+   * Перед остановкой видео гарантированно отправляем STOP камере.
+   * Операция асинхронная и не блокирует завершение основного потока.
+   */
+  cameraCommandDispatcher.shutdown(`APP_${signal}`).catch((error) => {
+    logger.warn('[CAMERA] Ошибка завершения драйвера:', error.message);
+  });
+
+  /**
    * Останавливаем дочерний процесс FFmpeg.
    */
   try {
@@ -1155,6 +1202,7 @@ logger.info(
 );
 
 logger.info(`Ожидаемый FPS камеры: ` + `${config.frame.fps}`);
+logger.info(`FPS rawvideo для аналитики: ` + `${config.frame.outputFps}`);
 
 logger.info(`Размер одного кадра: ` + `${parser.frameSize} байт`);
 

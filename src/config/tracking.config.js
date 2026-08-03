@@ -24,6 +24,19 @@ module.exports = {
   /** Радиус красного круга автоматического захвата, пикселей. */
   captureRadius: 180,
 
+  /**
+   * Алгоритм сопровождения одиночной зелёной цели.
+   *
+   * KCF — основной режим реального времени для Full HD.
+   * CSRT — точнее, но на CPU может занимать сотни миллисекунд на кадр.
+   * MIL — резервный вариант.
+   */
+  trackerType: 'CSRT',
+  trackerMinWidth: 8,
+  trackerMinHeight: 8,
+  trackerMaxConsecutiveErrors: 3,
+  trackerDebug: false,
+
   /** Размеры мёртвой зоны будущего PTZ-управления. */
   deadZoneX: 100,
   deadZoneY: 70,

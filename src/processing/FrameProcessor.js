@@ -28,6 +28,8 @@ class FrameProcessor {
     trackingConfig,
     profileManager,
     manualControl = null,
+    cameraCommandDispatcher = null,
+    cameraControlConfig = {},
   }) {
     if (!Number.isInteger(width) || width <= 0) {
       throw new Error('Ширина кадра должна быть положительным целым числом');
@@ -65,6 +67,8 @@ class FrameProcessor {
       config: initialTrackingConfig,
       motionConfig: profileManager.getMotionConfig(),
       manualControl,
+      cameraCommandDispatcher,
+      cameraControlConfig,
     });
 
     this.renderer = new FrameRenderer({

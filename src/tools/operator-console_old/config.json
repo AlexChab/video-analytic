@@ -1,9 +1,0 @@
-{
-  "consoleHost": "127.0.0.1",
-  "consolePort": 8090,
-  "trackingApi": "http://127.0.0.1:8081",
-  "refreshMs": 500,
-  "frameWidth": 1920,
-  "frameHeight": 1080,
-  "requestTimeoutMs": 3000
-}

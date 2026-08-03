@@ -5,7 +5,7 @@
 module.exports = {
   // ---------- Обработка изображения ----------
 
-  threshold: 25,
+  threshold: 20,
   blurSize: 7,
   dilateIterations: 1,
   closeIterations: 1,
@@ -20,8 +20,8 @@ module.exports = {
   minContourArea: 400,
   minBoxArea: 1400,
 
-  minWidth: 80,
-  minHeight: 60,
+  minWidth: 28,
+  minHeight: 18,
 
   maxWidth: 400,
   maxHeight: 250,
@@ -34,6 +34,28 @@ module.exports = {
   // ---------- Объединение ----------
 
   mergePadding: 12,
+
+  // ---------- Стабилизация красных рамок ----------
+
+  stabilizer: {
+    enabled: true,
+
+    // Новая рамка появляется только после двух последовательных обнаружений.
+    confirmFrames: 2,
+
+    // Удерживать подтверждённую рамку до 600 мс после пропуска детектором.
+    holdTimeMs: 600,
+
+    // Дополнительный предел удержания по числу обработанных кадров.
+    maxLostFrames: 15,
+
+    // Условия сопоставления рамки с объектом на следующем кадре.
+    maxCenterDistance: 120,
+    minIou: 0.05,
+
+    // 0 — сильная инерция, 1 — координаты без сглаживания.
+    smoothingFactor: 0.35,
+  },
 
   // ---------- Морская сцена ----------
 

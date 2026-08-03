@@ -117,7 +117,17 @@ module.exports = {
   frame: {
     width: getPositiveInteger('FRAME_WIDTH', 1920),
     height: getPositiveInteger('FRAME_HEIGHT', 1080),
-    fps: getPositiveInteger('FRAME_FPS', 25),
+    /** Реальная частота кадров, заявленная камерой. */
+    fps: getPositiveInteger('FRAME_FPS', 30),
+
+    /**
+     * Частота кадров, которую FFmpeg передаёт в Node.js как rawvideo.
+     *
+     * Это значение намеренно ниже FPS камеры: буфер последнего кадра
+     * защищает аналитику от очереди, а ограничение здесь уменьшает объём
+     * данных в stdout FFmpeg и нагрузку на FrameParser.
+     */
+    outputFps: getPositiveInteger('FRAME_OUTPUT_FPS', 10),
     channels: 3,
     pixelFormat: 'bgr24',
   },

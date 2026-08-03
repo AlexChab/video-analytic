@@ -3,20 +3,15 @@
 const { EventEmitter } = require('node:events');
 
 /**
- * FrameParser разделяет непрерывный бинарный поток FFmpeg
- * на отдельные кадры фиксированного размера.
+ * FrameParser v2 собирает rawvideo-кадры фиксированного размера
+ * без Buffer.concat() и без накопления массива чанков.
  *
- * Событие stdout "data" не соответствует одному кадру:
- * один chunk может содержать часть кадра, один кадр
- * или сразу несколько кадров.
+ * FFmpeg передаёт stdout произвольными частями. Парсер последовательно
+ * копирует эти части в заранее выделенный буфер кадра. Когда кадр собран,
+ * сам буфер передаётся дальше без дополнительной копии.
  *
- * Особенность этого варианта:
- * если внутри парсера накопилось несколько полных кадров,
- * устаревшие кадры отбрасываются, а наружу передаётся
- * только самый свежий полный кадр.
- *
- * Это помогает не накапливать многосекундное отставание,
- * когда аналитика временно работает медленнее входного потока.
+ * Переданный буфер возвращается в небольшой внутренний пул только после того,
+ * как LatestFrameBuffer или FrameScheduler вызовет metadata.release().
  */
 class FrameParser extends EventEmitter {
   /**
@@ -24,206 +19,176 @@ class FrameParser extends EventEmitter {
    * @param {number} options.width Ширина выходного кадра.
    * @param {number} options.height Высота выходного кадра.
    * @param {number} [options.channels=3] Количество каналов BGR.
+   * @param {number} [options.poolSize=3] Начальное число буферов кадров.
    */
-  constructor({ width, height, channels = 3 }) {
+  constructor({ width, height, channels = 3, poolSize = 3 }) {
     super();
 
     if (!Number.isInteger(width) || width <= 0) {
       throw new Error('Ширина кадра должна быть положительным целым числом');
     }
-
     if (!Number.isInteger(height) || height <= 0) {
       throw new Error('Высота кадра должна быть положительным целым числом');
     }
-
     if (!Number.isInteger(channels) || channels <= 0) {
-      throw new Error(
-        'Количество каналов должно быть положительным целым числом',
-      );
+      throw new Error('Количество каналов должно быть положительным целым числом');
+    }
+    if (!Number.isInteger(poolSize) || poolSize < 2) {
+      throw new Error('Размер пула FrameParser должен быть не меньше 2');
     }
 
     this.width = width;
     this.height = height;
     this.channels = channels;
-
-    /**
-     * BGR24 использует три байта на каждый пиксель.
-     *
-     * Для 1280 × 720:
-     * 1280 × 720 × 3 = 2 764 800 байт.
-     */
     this.frameSize = width * height * channels;
 
-    /**
-     * Здесь хранится незавершённый хвост следующего кадра.
-     *
-     * После каждого вызова push() все полные кадры удаляются,
-     * поэтому размер этого буфера в норме всегда меньше frameSize.
-     */
-    this.buffer = Buffer.alloc(0);
+    /** Свободные буферы, готовые для сборки следующих кадров. */
+    this.freeBuffers = [];
+    for (let index = 0; index < poolSize; index += 1) {
+      this.freeBuffers.push(Buffer.allocUnsafe(this.frameSize));
+    }
 
-    /**
-     * Номер реально переданного наружу кадра.
-     */
+    /** Буфер, который сейчас заполняется данными stdout FFmpeg. */
+    this.currentBuffer = this.#acquireBuffer();
+    this.currentOffset = 0;
+
+    /** Диагностические счётчики. */
     this.frameNumber = 0;
-
-    /**
-     * Общее количество полных кадров,
-     * отброшенных из-за накопившейся очереди.
-     */
-    this.droppedFrameNumber = 0;
+    this.totalBytes = 0;
+    this.partialChunks = 0;
+    this.multiFrameChunks = 0;
+    this.poolAllocations = 0;
+    this.inUseBuffers = 0;
+    this.peakInUseBuffers = 0;
   }
 
   /**
-   * Добавляет очередную часть бинарных данных из stdout FFmpeg.
+   * Добавляет очередной бинарный chunk из stdout FFmpeg.
+   * Один chunk может содержать часть кадра или несколько кадров.
    *
-   * @param {Buffer} chunk Часть потока rawvideo.
+   * @param {Buffer} chunk
    */
   push(chunk) {
     if (!Buffer.isBuffer(chunk)) {
       throw new TypeError('FrameParser принимает только Buffer');
     }
-
     if (chunk.length === 0) {
       return;
     }
 
-    /**
-     * Добавляем новый chunk к незавершённому хвосту
-     * предыдущего кадра.
-     */
-    this.buffer = Buffer.concat([this.buffer, chunk]);
+    this.totalBytes += chunk.length;
 
-    /**
-     * Определяем, сколько полных кадров сейчас находится
-     * внутри накопленного буфера.
-     */
-    const completeFrameCount = Math.floor(this.buffer.length / this.frameSize);
+    let chunkOffset = 0;
+    let completedInThisChunk = 0;
 
-    /**
-     * Полного кадра пока нет.
-     * Оставляем данные в буфере и ждём следующий chunk.
-     */
-    if (completeFrameCount === 0) {
-      return;
+    while (chunkOffset < chunk.length) {
+      const bytesNeeded = this.frameSize - this.currentOffset;
+      const bytesAvailable = chunk.length - chunkOffset;
+      const bytesToCopy = Math.min(bytesNeeded, bytesAvailable);
+
+      chunk.copy(
+        this.currentBuffer,
+        this.currentOffset,
+        chunkOffset,
+        chunkOffset + bytesToCopy,
+      );
+
+      this.currentOffset += bytesToCopy;
+      chunkOffset += bytesToCopy;
+
+      if (this.currentOffset < this.frameSize) {
+        this.partialChunks += 1;
+        continue;
+      }
+
+      completedInThisChunk += 1;
+      this.#emitCompletedFrame(this.currentBuffer);
+
+      this.currentBuffer = this.#acquireBuffer();
+      this.currentOffset = 0;
     }
 
-    /**
-     * Если накопилось несколько кадров, выбираем последний.
-     *
-     * Например:
-     * completeFrameCount = 4
-     *
-     * Кадры 1, 2 и 3 уже устарели.
-     * Для аналитики и PTZ нужен кадр 4.
-     */
-    const latestFrameOffset = (completeFrameCount - 1) * this.frameSize;
-
-    const latestFrameEnd = latestFrameOffset + this.frameSize;
-
-    /**
-     * Создаём независимую копию самого свежего полного кадра.
-     *
-     * Это важно, потому что this.buffer ниже будет заменён.
-     */
-    const latestFrame = Buffer.from(
-      this.buffer.subarray(latestFrameOffset, latestFrameEnd),
-    );
-
-    /**
-     * Все полные кадры считаются потреблёнными.
-     *
-     * После них может оставаться начало следующего,
-     * ещё не полностью полученного кадра.
-     */
-    const consumedBytes = completeFrameCount * this.frameSize;
-
-    /**
-     * Сохраняем только незавершённый хвост.
-     *
-     * Buffer.from() здесь создаёт независимый маленький буфер,
-     * чтобы не удерживать в памяти весь старый большой Buffer.
-     */
-    this.buffer = Buffer.from(this.buffer.subarray(consumedBytes));
-
-    /**
-     * Все полные кадры, кроме последнего,
-     * считаются отброшенными.
-     */
-    const droppedFrameCount = completeFrameCount - 1;
-
-    if (droppedFrameCount > 0) {
-      this.droppedFrameNumber += droppedFrameCount;
-
-      /**
-       * Отдельное событие удобно использовать
-       * для статистики и диагностики.
-       */
-      this.emit('drop', {
-        count: droppedFrameCount,
-        total: this.droppedFrameNumber,
-      });
+    if (completedInThisChunk > 1) {
+      this.multiFrameChunks += 1;
     }
+  }
 
+  /** Передаёт полностью собранный кадр и функцию возврата буфера в пул. */
+  #emitCompletedFrame(frameBuffer) {
     this.frameNumber += 1;
+    this.inUseBuffers += 1;
+    this.peakInUseBuffers = Math.max(this.peakInUseBuffers, this.inUseBuffers);
 
-    /**
-     * Наружу передаём только самый свежий полный кадр.
-     */
-    this.emit('frame', latestFrame, {
+    let released = false;
+
+    const release = () => {
+      if (released) {
+        return;
+      }
+
+      released = true;
+      this.inUseBuffers = Math.max(0, this.inUseBuffers - 1);
+      this.freeBuffers.push(frameBuffer);
+    };
+
+    this.emit('frame', frameBuffer, {
       number: this.frameNumber,
       width: this.width,
       height: this.height,
       channels: this.channels,
       size: this.frameSize,
+      bufferedBytes: this.currentOffset,
 
       /**
-       * Количество кадров, отброшенных именно
-       * при текущем вызове push().
+       * Получатель обязан вызвать release(), когда кадр больше не используется.
+       * LatestFrameBuffer и FrameScheduler v2 делают это автоматически.
        */
-      dropped: droppedFrameCount,
-
-      /**
-       * Общее количество отброшенных кадров
-       * с момента запуска или reset().
-       */
-      droppedTotal: this.droppedFrameNumber,
-
-      /**
-       * Размер оставшегося незавершённого хвоста.
-       *
-       * В норме он должен быть меньше frameSize.
-       */
-      bufferedBytes: this.buffer.length,
+      release,
     });
   }
 
-  /**
-   * Возвращает статистику текущего состояния парсера.
-   *
-   * @returns {{
-   *   emittedFrames: number,
-   *   droppedFrames: number,
-   *   bufferedBytes: number,
-   *   frameSize: number
-   * }}
-   */
+  /** Берёт свободный буфер или создаёт новый только при исчерпании пула. */
+  #acquireBuffer() {
+    const buffer = this.freeBuffers.pop();
+
+    if (buffer) {
+      return buffer;
+    }
+
+    this.poolAllocations += 1;
+    return Buffer.allocUnsafe(this.frameSize);
+  }
+
+  /** Возвращает статистику текущего состояния парсера. */
   getStats() {
     return {
       emittedFrames: this.frameNumber,
-      droppedFrames: this.droppedFrameNumber,
-      bufferedBytes: this.buffer.length,
+      droppedFrames: 0,
+      bufferedBytes: this.currentOffset,
       frameSize: this.frameSize,
+      fillRatio: this.currentOffset / this.frameSize,
+      totalBytes: this.totalBytes,
+      partialChunks: this.partialChunks,
+      multiFrameChunks: this.multiFrameChunks,
+      freeBuffers: this.freeBuffers.length,
+      inUseBuffers: this.inUseBuffers,
+      peakInUseBuffers: this.peakInUseBuffers,
+      poolAllocations: this.poolAllocations,
     };
   }
 
   /**
-   * Очищает накопленные данные и статистику.
+   * Сбрасывает незавершённый кадр и статистику.
+   * Уже переданные кадры остаются валидными и вернутся в пул через release().
    */
   reset() {
-    this.buffer = Buffer.alloc(0);
+    this.currentOffset = 0;
     this.frameNumber = 0;
-    this.droppedFrameNumber = 0;
+    this.totalBytes = 0;
+    this.partialChunks = 0;
+    this.multiFrameChunks = 0;
+    this.poolAllocations = 0;
+    this.peakInUseBuffers = this.inUseBuffers;
   }
 }
 

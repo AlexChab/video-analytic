@@ -4,8 +4,9 @@
 const logger = require('../utils/Logger');
 const { performance } = require('node:perf_hooks');
 const MotionDetector = require('../detection/MotionDetector');
+const DetectionStabilizer = require('../detection/DetectionStabilizer');
 const ObjectTracker = require('../analytics/ObjectTracker');
-const PtzController = require('./PtzController');
+const CameraController = require('../camera/CameraController');
 const ObjectIdManager = require('./ObjectIdManager');
 
 /**
@@ -14,7 +15,15 @@ const ObjectIdManager = require('./ObjectIdManager');
  * но не рисует рамки, пока API не передаст ID объекта или точку изображения.
  */
 class TrackingManager {
-  constructor({ width, height, config, motionConfig, manualControl = null }) {
+  constructor({
+    width,
+    height,
+    config,
+    motionConfig,
+    manualControl = null,
+    cameraCommandDispatcher = null,
+    cameraControlConfig = {},
+  }) {
     this.width = width;
     this.height = height;
     this.config = config;
@@ -38,27 +47,39 @@ class TrackingManager {
     }
 
     this.motionDetector = new MotionDetector(motionConfig);
+    this.detectionStabilizer = new DetectionStabilizer(
+      motionConfig.stabilizer ?? {},
+    );
     this.objectIdManager = new ObjectIdManager({
       maxMatchDistance: config.objectIdMaxDistance ?? 120,
       lostFrameLimit: config.objectIdLostFrameLimit ?? 12,
     });
     this.objectTracker = new ObjectTracker({
-      type: 'CSRT',
-      minWidth: 8,
-      minHeight: 8,
-      maxConsecutiveErrors: 3,
-      debug: false,
+      // CSRT на Full HD может занимать 150–400 мс на один update().
+      // KCF заметно быстрее и поэтому используется как базовый режим реального времени.
+      // При необходимости алгоритм можно вернуть через tracking.trackerType.
+      type: config.trackerType ?? 'KCF',
+      minWidth: config.trackerMinWidth ?? 8,
+      minHeight: config.trackerMinHeight ?? 8,
+      maxConsecutiveErrors: config.trackerMaxConsecutiveErrors ?? 3,
+      debug: Boolean(config.trackerDebug ?? false),
     });
-    this.ptzController = new PtzController({
+    this.cameraController = new CameraController({
       frameWidth: width,
       frameHeight: height,
       deadZoneX: config.deadZoneX,
       deadZoneY: config.deadZoneY,
-      commandIntervalMs: config.ptzCommandIntervalMs ?? 300,
+      commandDispatcher: cameraCommandDispatcher,
       kalmanEnabled: config.kalmanEnabled ?? true,
       kalmanProcessNoise: config.kalmanProcessNoise ?? 35,
       kalmanMeasurementNoise: config.kalmanMeasurementNoise ?? 90,
       predictionLeadMs: config.ptzPredictionLeadMs ?? 120,
+      minPanSpeed: cameraControlConfig.minPanSpeed ?? 0.15,
+      maxPanSpeed: cameraControlConfig.maxPanSpeed ?? 1,
+      minTiltSpeed: cameraControlConfig.minTiltSpeed ?? 0.15,
+      maxTiltSpeed: cameraControlConfig.maxTiltSpeed ?? 1,
+      invertPan: cameraControlConfig.invertPan ?? false,
+      invertTilt: cameraControlConfig.invertTilt ?? false,
     });
 
     this.previousState = 'WAITING_COMMAND';
@@ -97,14 +118,14 @@ class TrackingManager {
     this.mode = nextMode;
     this.captureType = nextCaptureType;
     this.motionDetector.updateConfiguration(motion);
+    this.detectionStabilizer.updateConfiguration(motion.stabilizer ?? {});
     this.objectIdManager.updateConfiguration({
       maxMatchDistance: this.config.objectIdMaxDistance,
       lostFrameLimit: this.config.objectIdLostFrameLimit,
     });
-    this.ptzController.updateConfiguration({
+    this.cameraController.updateConfiguration({
       deadZoneX: this.config.deadZoneX,
       deadZoneY: this.config.deadZoneY,
-      commandIntervalMs: this.config.ptzCommandIntervalMs,
       kalmanEnabled: this.config.kalmanEnabled,
       kalmanProcessNoise: this.config.kalmanProcessNoise,
       kalmanMeasurementNoise: this.config.kalmanMeasurementNoise,
@@ -124,7 +145,10 @@ class TrackingManager {
   getConfiguration() {
     return {
       tracking: { ...this.config, mode: this.mode, captureType: this.captureType },
-      motion: this.motionDetector.getConfiguration(),
+      motion: {
+        ...this.motionDetector.getConfiguration(),
+        stabilizer: this.detectionStabilizer.getConfiguration(),
+      },
     };
   }
 
@@ -139,11 +163,18 @@ class TrackingManager {
   }
 
   #detect(frame) {
-    const startedAt = performance.now();
-    const detections = this.objectIdManager.update(
-      this.motionDetector.detect(frame),
-    );
+    let startedAt = performance.now();
+    const rawDetections = this.motionDetector.detect(frame);
     this.#record('motionDetector', performance.now() - startedAt);
+
+    startedAt = performance.now();
+    const stableDetections = this.detectionStabilizer.update(rawDetections);
+    this.#record('detectionStabilizer', performance.now() - startedAt);
+
+    startedAt = performance.now();
+    const detections = this.objectIdManager.update(stableDetections);
+    this.#record('objectIdManager', performance.now() - startedAt);
+
     return detections;
   }
 
@@ -214,14 +245,21 @@ class TrackingManager {
     const visibleDetections = this.config.showDetectionsInManualMode
       ? detections
       : [];
+    let startedAt = performance.now();
     const ptzCommand =
       state === 'TRACKING'
-        ? this.ptzController.calculate(targetCenter)
+        ? this.cameraController.calculate(targetCenter)
         : this.#stopCommand();
+    this.#record('ptzCalculate', performance.now() - startedAt);
 
     // Реальная отправка PTZ пока остаётся в тестовом контроллере.
-    this.ptzController.execute(ptzCommand, state);
+    // Отдельно измеряем execute(), чтобы будущий сетевой драйвер камеры
+    // не мог незаметно заблокировать видеоконвейер.
+    startedAt = performance.now();
+    this.cameraController.execute(ptzCommand, state);
+    this.#record('ptzExecute', performance.now() - startedAt);
 
+    startedAt = performance.now();
     this.manualControl.setStatus({
       state,
       message,
@@ -230,6 +268,7 @@ class TrackingManager {
       trackedRect,
       frame: { width: this.width, height: this.height },
     });
+    this.#record('manualStatus', performance.now() - startedAt);
     this.previousState = state;
     return { detections: visibleDetections, tracking, trackedRect, ptzCommand };
   }
@@ -242,7 +281,7 @@ class TrackingManager {
           : 'API: сброс цели',
       );
       this.activeTargetId = null;
-      this.ptzController.reset(command.type);
+      this.cameraController.reset(command.type);
       return;
     }
     if (command.type === 'ENABLE') return;
@@ -267,7 +306,7 @@ class TrackingManager {
 
     try {
       this.objectTracker.reset('Новая команда ручного выбора');
-      this.ptzController.reset('Новая цель');
+      this.cameraController.reset('Новая цель');
       this.objectTracker.start(frame, target);
       this.activeTargetId = target.id ?? null;
       this.motionDetector.reset();
@@ -329,9 +368,10 @@ class TrackingManager {
 
   reset() {
     this.motionDetector.reset();
+    this.detectionStabilizer.reset();
     this.objectIdManager.reset();
     this.objectTracker.reset('Сброс TrackingManager');
-    this.ptzController.reset('Сброс TrackingManager');
+    this.cameraController.reset('Сброс TrackingManager');
     this.previousState = 'WAITING_COMMAND';
     this.activeTargetId = null;
   }

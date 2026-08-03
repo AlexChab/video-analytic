@@ -175,6 +175,8 @@ class Logger {
       'КАДР': 'VIDEO',
       'PROFILEMANAGER': 'PROFILE',
       'PROFILE_MANAGER': 'PROFILE',
+      'CAMERA:SIM': 'CAMERA',
+      'CAMERA_SIM': 'CAMERA',
     };
 
     return aliases[raw] || raw.replace(/\s+/gu, '_');
