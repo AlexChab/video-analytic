@@ -193,6 +193,41 @@ class DetectionStabilizer {
       }));
   }
 
+  /**
+   * Возвращает инженерный снимок внутренних track стабилизатора.
+   *
+   * В отличие от update(), здесь присутствуют и НЕПОДТВЕРЖДЁННЫЕ кандидаты.
+   * Это позволяет Motion Inspector показать:
+   *
+   *   RAW есть
+   *   seenFrames=1/2
+   *   confirmed=NO
+   *
+   * то есть точную причину, почему красная рамка ещё не появилась.
+   */
+  getDiagnosticsSnapshot() {
+    return Array.from(this.tracks.values()).map((track) => ({
+      trackId: track.id,
+      box: this.#roundBox(track.box),
+      lastDetection: track.lastDetection
+        ? {
+          ...track.lastDetection,
+          ...this.#roundBox(track.lastDetection),
+        }
+        : null,
+      firstSeenAt: track.firstSeenAt,
+      lastSeenAt: track.lastSeenAt,
+      seenFrames: track.seenFrames,
+      lostFrames: track.lostFrames,
+      matched: Boolean(track.matched),
+      confirmed: Boolean(track.confirmed),
+      requiredConfirmFrames: this.confirmFrames,
+      state: track.confirmed
+        ? (track.matched ? 'CONFIRMED' : 'COASTING')
+        : 'WAITING_CONFIRMATION',
+    }));
+  }
+
   reset() {
     this.tracks.clear();
     this.nextTrackId = 1;

@@ -1,13 +1,15 @@
 import { state } from './state.js';
-import { trackingApi } from './api.js';
+import { trackingApi, recordingApi } from './api.js';
 import { renderCanvas, getObjectId } from './renderer.js';
 import { bindCanvas } from './canvas.js';
 import { clearLog } from './logger.js';
+import { initializeMotionSettings } from './motion-settings.js';
+import { initializeObservationSettings } from './observation-settings.js';
 import { TargetRegistry } from './target-registry.js';
 import { TargetIntelligenceCoordinator } from './intelligence-coordinator.js';
 import {
   showConfig, showConnection, showMode, showStatus, showPointer, showTarget,
-  showTrackingDuration, showSources, showRibbon, showRawJson, getRawJsonText
+  showTrackingDuration, showSources, showRibbon, showRawJson, getRawJsonText, showRecording
 } from './ui.js';
 
 const canvas = document.querySelector('#trackingCanvas');
@@ -45,6 +47,7 @@ function render() {
   showTrackingDuration(state.activeTarget);
   showSources(state.intelligenceSources);
   showRibbon(state.mode, state.activeTarget, state.intelligenceSources);
+  showRecording(state.recording);
   renderRawJson();
 }
 
@@ -76,6 +79,43 @@ function setConnected(connected, message) {
   showConnection(connected, message);
 }
 
+
+async function syncRecordingStatus() {
+  try {
+    state.recording = await recordingApi.status();
+    showRecording(state.recording);
+  } catch (error) {
+    console.error('[AUTO REC] status:', error);
+  }
+}
+
+async function autoRecordStart(target) {
+  if (!state.recording?.autoEnabled) return;
+  try {
+    state.recording = await recordingApi.start({
+      targetId: target?.targetId ?? null,
+      frame: target?.frame ?? null,
+      selectedPoint: target?.selectedPoint ?? null,
+    });
+    showRecording(state.recording);
+  } catch (error) {
+    console.error('[AUTO REC] start:', error);
+  }
+}
+
+async function autoRecordStop(reason, { immediate = false } = {}) {
+  try {
+    state.recording = await recordingApi.stop(
+      reason,
+      immediate ? 0 : state.recording?.postRollSec
+    );
+    showRecording(state.recording);
+  } catch (error) {
+    console.error('[AUTO REC] stop:', error);
+    await syncRecordingStatus();
+  }
+}
+
 function enterTracking(target) {
   registry.setState('TRACKING');
   state.activeTarget = registry.getActive() || target;
@@ -83,9 +123,14 @@ function enterTracking(target) {
   coordinator.start(state.activeTarget);
   restartDurationTimer();
   render();
+  autoRecordStart(state.activeTarget);
 }
 
 function returnToSearch(finalState = 'CANCELLED') {
+  autoRecordStop(finalState, {
+    // Ручной reset/disable не требует post-roll.
+    immediate: finalState === 'CANCELLED' || finalState === 'DISABLED',
+  });
   coordinator.cancel();
   registry.clear(finalState);
   state.activeTarget = null;
@@ -133,11 +178,45 @@ async function refreshStatus({ silent = false } = {}) {
     rememberResponse(result);
     setConnected(true);
 
-    // Если сервер сообщил об отсутствии цели, консоль автоматически возвращается в SEARCH.
+    /*
+     * Сервер является источником истины для состояния сопровождения.
+     *
+     * TEMPORARILY_LOST не считаем окончательной потерей: KCF ещё активен и
+     * может восстановить цель на следующих кадрах.
+     *
+     * Когда ObjectTracker окончательно сброшен, TrackingManager возвращает:
+     *   state = WAITING_COMMAND
+     *   targetId = null
+     *
+     * Раньше WAITING_COMMAND отсутствовал в списке терминальных состояний,
+     * поэтому Operator Console продолжала показывать режим TRACKING до
+     * ручного нажатия кнопки сброса.
+     */
     const apiTargetId = getApiTargetId(state.trackingStatus);
-    const apiState = String(state.trackingStatus?.state ?? state.trackingStatus?.status ?? '').toUpperCase();
-    if (state.mode === 'TRACKING' && apiTargetId === null && ['IDLE', 'SEARCH', 'READY', 'NONE'].includes(apiState)) {
-      returnToSearch('LOST');
+    const apiState = String(
+      state.trackingStatus?.state ??
+      state.trackingStatus?.status ??
+      '',
+    ).toUpperCase();
+
+    const terminalStatesWithoutTarget = new Set([
+      'WAITING_COMMAND',
+      'IDLE',
+      'SEARCH',
+      'READY',
+      'NONE',
+      'LOST',
+      'DISABLED',
+    ]);
+
+    const targetIsGone =
+      apiTargetId === null &&
+      terminalStatesWithoutTarget.has(apiState);
+
+    if (state.mode === 'TRACKING' && targetIsGone) {
+      returnToSearch(
+        apiState === 'DISABLED' ? 'DISABLED' : 'LOST',
+      );
     } else {
       render();
     }
@@ -235,6 +314,41 @@ async function initialize() {
     onRender: render
   });
 
+  const autoRecordCheckbox = document.querySelector('#autoRecordCheckbox');
+  const autoRecordToggle = document.querySelector('#autoRecordToggle');
+
+  async function toggleAutoRecording(nextValue = null) {
+    const enabled =
+      nextValue === null
+        ? !state.recording?.autoEnabled
+        : Boolean(nextValue);
+
+    try {
+      state.recording = await recordingApi.auto(enabled);
+      showRecording(state.recording);
+    } catch (error) {
+      console.error('[AUTO REC] toggle:', error);
+      await syncRecordingStatus();
+    }
+  }
+
+  autoRecordToggle.addEventListener('click', () => {
+    toggleAutoRecording();
+  });
+
+  autoRecordCheckbox.addEventListener('change', (event) => {
+    event.stopPropagation();
+    toggleAutoRecording(autoRecordCheckbox.checked);
+  });
+
+  window.addEventListener('keydown', (event) => {
+    if (event.key !== 'F8') return;
+    const tag = String(event.target?.tagName || '').toUpperCase();
+    if (['INPUT', 'SELECT', 'TEXTAREA'].includes(tag)) return;
+    event.preventDefault();
+    toggleAutoRecording();
+  });
+
   autoRefreshCheckbox.addEventListener('change', restartAutoRefresh);
   refreshIntervalSelect.addEventListener('change', restartAutoRefresh);
   document.querySelector('#refreshButton').addEventListener('click', () => refreshAll());
@@ -243,13 +357,23 @@ async function initialize() {
   document.querySelector('#resetButton').addEventListener('click', async () => {
     try { await executeCommand(trackingApi.reset); } finally { returnToSearch('CANCELLED'); }
   });
+
+  document.querySelector('#stopRecordingButton').addEventListener('click', async () => {
+    await autoRecordStop('MANUAL_RECORD_STOP', { immediate: true });
+  });
   document.querySelector('#clearLogButton').addEventListener('click', clearLog);
   document.querySelector('#copyJsonButton').addEventListener('click', copyRawJson);
   bindJsonTabs();
 
   render();
-  await refreshAll({ silent: true });
+  await Promise.all([
+    refreshAll({ silent: true }),
+    initializeMotionSettings(),
+    initializeObservationSettings(),
+    syncRecordingStatus(),
+  ]);
   restartAutoRefresh();
+  setInterval(() => showRecording(state.recording), 1000);
 }
 
 initialize().catch((error) => {

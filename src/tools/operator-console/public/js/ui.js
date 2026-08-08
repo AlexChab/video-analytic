@@ -4,7 +4,10 @@ const elements = Object.fromEntries([
   'panelTitle', 'panelMode', 'searchPanel', 'trackingPanel', 'searchObjectCount',
   'trackingEnabled', 'trackingState', 'activeTargetLabel', 'targetLifecycleState',
   'targetId', 'targetCoordinates', 'targetBoxSize', 'trackerType', 'trackingDuration',
-  'sourceStateList', 'intelligenceProgress', 'rawJson'
+  'sourceStateList', 'intelligenceProgress', 'rawJson',
+  'autoRecordCheckbox', 'recordingState', 'recordingTimer',
+  'recordingFile', 'recordingConfigHint', 'recordingPostRoll', 'autoRecordToggle',
+  'stopRecordingButton'
 ].map((id) => [id, document.querySelector(`#${id}`)]));
 
 export function showConfig(config) {
@@ -124,4 +127,62 @@ export function showRawJson(data) {
 
 export function getRawJsonText() {
   return elements.rawJson.textContent;
+}
+
+
+export function showRecording(recording = {}) {
+  if (!elements.autoRecordCheckbox) return;
+
+  elements.autoRecordCheckbox.checked = Boolean(recording.autoEnabled);
+
+  const visualState = recording.recording
+    ? (recording.pendingStop ? 'post' : 'rec')
+    : (recording.autoEnabled ? 'armed' : 'off');
+
+  elements.recordingState.textContent =
+    visualState === 'rec'
+      ? 'REC'
+      : visualState === 'post'
+        ? 'POST'
+        : visualState === 'armed'
+          ? 'ARMED'
+          : 'OFF';
+
+  elements.recordingState.dataset.state = visualState;
+  elements.autoRecordToggle?.setAttribute('data-state', visualState);
+
+  if (elements.stopRecordingButton) {
+    elements.stopRecordingButton.disabled = !recording.recording;
+  }
+
+  if (elements.recordingPostRoll) {
+    elements.recordingPostRoll.textContent =
+      `${Number(recording.postRollSec ?? 5)} с`;
+  }
+
+  if (recording.current?.startedAt) {
+    const sec = Math.max(
+      0,
+      Math.floor(
+        (Date.now() - new Date(recording.current.startedAt).getTime()) / 1000,
+      ),
+    );
+
+    elements.recordingTimer.textContent =
+      `${String(Math.floor(sec / 60)).padStart(2, '0')}:` +
+      `${String(sec % 60).padStart(2, '0')}`;
+  } else {
+    elements.recordingTimer.textContent = '00:00';
+  }
+
+  const file = recording.current?.videoPath || '';
+  elements.recordingFile.textContent =
+    file.split(/[\\/]/).pop() || '—';
+
+  if (elements.recordingConfigHint) {
+    elements.recordingConfigHint.textContent =
+      recording.autoEnabled
+        ? `Автозапис готовий. Максимум ${Number(recording.maxDurationSec ?? 30)} с.`
+        : 'Автозапис вимкнено.';
+  }
 }

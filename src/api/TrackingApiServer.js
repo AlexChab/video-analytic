@@ -14,10 +14,11 @@ const FORBIDDEN_PATH_PARTS = new Set(['__proto__', 'prototype', 'constructor']);
  */
 class TrackingApiServer {
   constructor({
-    host = '127.0.0.1',
+    host = '0.0.0.0',
     port = 8081,
     control,
     profileManager = null,
+    observationEnhancer = null,
     frameWidth,
     frameHeight,
   }) {
@@ -25,6 +26,7 @@ class TrackingApiServer {
     this.port = port;
     this.control = control;
     this.profileManager = profileManager;
+    this.observationEnhancer = observationEnhancer;
     this.frameWidth = frameWidth;
     this.frameHeight = frameHeight;
     this.server = null;
@@ -58,7 +60,18 @@ class TrackingApiServer {
 
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
-      const configResponse = await this.#handleConfigurationRoutes(req, res, url);
+      const observationResponse = await this.#handleObservationRoutes(
+        req,
+        res,
+        url,
+      );
+      if (observationResponse) return;
+
+      const configResponse = await this.#handleConfigurationRoutes(
+        req,
+        res,
+        url,
+      );
       if (configResponse) return;
 
       const trackingResponse = await this.#handleTrackingRoutes(req, res, url);
@@ -79,10 +92,105 @@ class TrackingApiServer {
     }
   }
 
+  async #handleObservationRoutes(req, res, url) {
+    if (!url.pathname.startsWith('/api/observation')) {
+      return false;
+    }
+
+    if (!this.observationEnhancer) {
+      this.#json(res, 503, {
+        success: false,
+        error: 'ObservationEnhancer не подключён',
+      });
+      return true;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/observation') {
+      this.#json(res, 200, {
+        success: true,
+        observation: this.observationEnhancer.getStatus(),
+      });
+      return true;
+    }
+
+    if (
+      ['PUT', 'POST', 'PATCH'].includes(req.method) &&
+      url.pathname === '/api/observation/mode'
+    ) {
+      const body = await this.#body(req);
+      const status = this.observationEnhancer.setMode(body.mode);
+
+      /*
+       * Выбор CLAHE/CLAHE_SHARPEN автоматически включает визуальную ветку.
+       * ORIGINAL остаётся явным режимом сравнения.
+       */
+      this.observationEnhancer.setEnabled(true);
+
+      apiLog.info(`Режим наблюдения: ${status.mode}`);
+      this.#json(res, 200, {
+        success: true,
+        observation: this.observationEnhancer.getStatus(),
+      });
+      return true;
+    }
+
+    if (
+      ['PUT', 'POST', 'PATCH'].includes(req.method) &&
+      url.pathname === '/api/observation/enabled'
+    ) {
+      const body = await this.#body(req);
+      const status = this.observationEnhancer.setEnabled(body.enabled);
+
+      apiLog.info(
+        `Визуальная ветка наблюдения: ${
+          status.enabled ? 'включена' : 'выключена'
+        }`,
+      );
+
+      this.#json(res, 200, {
+        success: true,
+        observation: status,
+      });
+      return true;
+    }
+
+    if (
+      ['PUT', 'POST', 'PATCH'].includes(req.method) &&
+      url.pathname === '/api/observation/clahe'
+    ) {
+      const body = await this.#body(req);
+      const status = this.observationEnhancer.setClahe(body);
+
+      this.#json(res, 200, {
+        success: true,
+        observation: status,
+      });
+      return true;
+    }
+
+    if (
+      ['PUT', 'POST', 'PATCH'].includes(req.method) &&
+      url.pathname === '/api/observation/sharpen'
+    ) {
+      const body = await this.#body(req);
+      const status = this.observationEnhancer.setSharpen(body);
+
+      this.#json(res, 200, {
+        success: true,
+        observation: status,
+      });
+      return true;
+    }
+
+    return false;
+  }
+
   async #handleConfigurationRoutes(req, res, url) {
-    if (!url.pathname.startsWith('/api/config')
-      && !url.pathname.startsWith('/api/runtime')
-      && !url.pathname.startsWith('/api/profile')) {
+    if (
+      !url.pathname.startsWith('/api/config') &&
+      !url.pathname.startsWith('/api/runtime') &&
+      !url.pathname.startsWith('/api/profile')
+    ) {
       return false;
     }
 
@@ -100,7 +208,10 @@ class TrackingApiServer {
     const configPath = this.#extractConfigPath(url.pathname);
     if (configPath !== null) {
       if (req.method === 'GET') {
-        const result = this.#getByPath(profileManager.getEffectiveConfig(), configPath);
+        const result = this.#getByPath(
+          profileManager.getEffectiveConfig(),
+          configPath,
+        );
         if (!result.exists) {
           this.#json(res, 404, {
             success: false,
@@ -117,15 +228,25 @@ class TrackingApiServer {
         return true;
       }
 
-      if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+      if (
+        req.method === 'POST' ||
+        req.method === 'PUT' ||
+        req.method === 'PATCH'
+      ) {
         const body = await this.#body(req);
         if (!Object.prototype.hasOwnProperty.call(body, 'value')) {
           throw new Error('В JSON-теле необходимо передать поле value');
         }
 
-        const before = this.#getByPath(profileManager.getEffectiveConfig(), configPath);
+        const before = this.#getByPath(
+          profileManager.getEffectiveConfig(),
+          configPath,
+        );
         profileManager.setRuntimeOverride(configPath, body.value);
-        const after = this.#getByPath(profileManager.getEffectiveConfig(), configPath);
+        const after = this.#getByPath(
+          profileManager.getEffectiveConfig(),
+          configPath,
+        );
 
         apiLog.info(`Runtime-параметр изменён: ${configPath}`);
         this.#json(res, 200, {
@@ -139,9 +260,15 @@ class TrackingApiServer {
       }
 
       if (req.method === 'DELETE') {
-        const before = this.#getByPath(profileManager.getRuntimeOverrides(), configPath);
+        const before = this.#getByPath(
+          profileManager.getRuntimeOverrides(),
+          configPath,
+        );
         profileManager.clearRuntimeOverride(configPath);
-        const effective = this.#getByPath(profileManager.getEffectiveConfig(), configPath);
+        const effective = this.#getByPath(
+          profileManager.getEffectiveConfig(),
+          configPath,
+        );
 
         apiLog.info(`Runtime-параметр очищен: ${configPath}`);
         this.#json(res, 200, {
@@ -250,7 +377,10 @@ class TrackingApiServer {
       return true;
     }
 
-    if (req.method === 'POST' && url.pathname === '/api/tracking/target/point') {
+    if (
+      req.method === 'POST' &&
+      url.pathname === '/api/tracking/target/point'
+    ) {
       const body = await this.#body(req);
       const x = Number(body.x);
       const y = Number(body.y);
@@ -293,9 +423,15 @@ class TrackingApiServer {
     if (!rawPath) throw new Error('Не указан путь параметра конфигурации');
 
     const normalized = rawPath.replace(/\//gu, '.');
-    const parts = normalized.split('.').map((part) => part.trim()).filter(Boolean);
+    const parts = normalized
+      .split('.')
+      .map((part) => part.trim())
+      .filter(Boolean);
 
-    if (parts.length === 0 || parts.some((part) => FORBIDDEN_PATH_PARTS.has(part))) {
+    if (
+      parts.length === 0 ||
+      parts.some((part) => FORBIDDEN_PATH_PARTS.has(part))
+    ) {
       throw new Error('Недопустимый путь параметра конфигурации');
     }
 
@@ -307,9 +443,11 @@ class TrackingApiServer {
     let value = object;
 
     for (const part of parts) {
-      if (value === null
-        || typeof value !== 'object'
-        || !Object.prototype.hasOwnProperty.call(value, part)) {
+      if (
+        value === null ||
+        typeof value !== 'object' ||
+        !Object.prototype.hasOwnProperty.call(value, part)
+      ) {
         return { exists: false, value: undefined };
       }
       value = value[part];
@@ -320,7 +458,9 @@ class TrackingApiServer {
 
   #requireProfileManager() {
     if (!this.profileManager) {
-      const error = new Error('Configuration API не подключён к ProfileManager');
+      const error = new Error(
+        'Configuration API не подключён к ProfileManager',
+      );
       error.statusCode = 503;
       throw error;
     }
@@ -348,14 +488,22 @@ class TrackingApiServer {
         if (finished) return;
         try {
           const body = text ? JSON.parse(text) : {};
-          if (body === null || Array.isArray(body) || typeof body !== 'object') {
+          if (
+            body === null ||
+            Array.isArray(body) ||
+            typeof body !== 'object'
+          ) {
             throw new Error('JSON-тело должно быть объектом');
           }
           resolve(body);
         } catch (error) {
-          reject(new Error(error.message === 'JSON-тело должно быть объектом'
-            ? error.message
-            : 'Требуется корректный JSON'));
+          reject(
+            new Error(
+              error.message === 'JSON-тело должно быть объектом'
+                ? error.message
+                : 'Требуется корректный JSON',
+            ),
+          );
         }
       });
       req.on('error', reject);
@@ -370,7 +518,10 @@ class TrackingApiServer {
 
   #setCommonHeaders(res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader(
+      'Access-Control-Allow-Methods',
+      'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+    );
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     res.setHeader('Cache-Control', 'no-store');
   }

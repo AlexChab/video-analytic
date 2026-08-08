@@ -41,6 +41,7 @@ class RtspReader extends EventEmitter {
     /** @type {import('node:child_process').ChildProcessWithoutNullStreams|null} */
     this.process = null;
     this.stopping = false;
+    this.forceKillTimer = null;
 
     this.stats = {
       starts: 0,
@@ -184,6 +185,11 @@ class RtspReader extends EventEmitter {
     });
 
     this.process.on('close', (code, signal) => {
+      if (this.forceKillTimer !== null) {
+        clearTimeout(this.forceKillTimer);
+        this.forceKillTimer = null;
+      }
+
       const wasStopping = this.stopping;
 
       this.process = null;
@@ -210,7 +216,26 @@ class RtspReader extends EventEmitter {
     }
 
     this.stopping = true;
-    this.process.kill('SIGTERM');
+
+    const processToStop = this.process;
+    processToStop.kill('SIGTERM');
+
+    if (this.forceKillTimer !== null) {
+      clearTimeout(this.forceKillTimer);
+    }
+
+    // Сетевой FFmpeg может зависнуть внутри подключения к недоступному RTSP.
+    // Через секунду принудительно завершаем только тот процесс, который
+    // существовал в момент вызова stop(), не затрагивая будущий restart.
+    this.forceKillTimer = setTimeout(() => {
+      this.forceKillTimer = null;
+
+      if (this.process === processToStop && !processToStop.killed) {
+        processToStop.kill('SIGKILL');
+      }
+    }, 1000);
+
+    this.forceKillTimer.unref?.();
   }
 
   /**

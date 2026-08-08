@@ -1,6 +1,7 @@
 'use strict';
 
 const cv = require('@u4/opencv4nodejs');
+const ptzDiagnostics = require('../camera/PtzDiagnosticsStore');
 
 /**
  * Накладывает служебную графику поверх видеокадра.
@@ -61,6 +62,26 @@ class FrameRenderer {
     this.showCaptureZone = booleanOrCurrent(configuration.showCaptureZone, this.showCaptureZone, true);
     this.showDeadZone = booleanOrCurrent(configuration.showDeadZone, this.showDeadZone, true);
     this.showObjectIds = booleanOrCurrent(configuration.showObjectIds, this.showObjectIds, true);
+    this.showTrackingModeHud = booleanOrCurrent(
+      configuration.showTrackingModeHud,
+      this.showTrackingModeHud,
+      true,
+    );
+    this.ptzDebugHudEnabled = booleanOrCurrent(
+      configuration.ptzDebugHudEnabled,
+      this.ptzDebugHudEnabled,
+      true,
+    );
+    this.captureDiagnosticsHudEnabled = booleanOrCurrent(
+      configuration.captureDiagnosticsHudEnabled,
+      this.captureDiagnosticsHudEnabled,
+      true,
+    );
+    this.debugHudVisible = booleanOrCurrent(
+      configuration.debugHudVisible,
+      this.debugHudVisible,
+      true,
+    );
 
     const currentConfiguration = this.getConfiguration();
     if (!initial) {
@@ -84,7 +105,31 @@ class FrameRenderer {
       showCaptureZone: this.showCaptureZone,
       showDeadZone: this.showDeadZone,
       showObjectIds: this.showObjectIds,
+      showTrackingModeHud: this.showTrackingModeHud,
+      ptzDebugHudEnabled: this.ptzDebugHudEnabled,
+      captureDiagnosticsHudEnabled: this.captureDiagnosticsHudEnabled,
+      debugHudVisible: this.debugHudVisible,
     };
+  }
+
+  /**
+   * Глобальный переключатель большого технического HUD.
+   *
+   * F1 меняет только визуализацию. Детектор, KCF, PTZ и сбор диагностики
+   * продолжают работать с прежними параметрами.
+   */
+  toggleDebugHud() {
+    this.debugHudVisible = !this.debugHudVisible;
+    return this.debugHudVisible;
+  }
+
+  setDebugHudVisible(visible) {
+    this.debugHudVisible = Boolean(visible);
+    return this.debugHudVisible;
+  }
+
+  isDebugHudVisible() {
+    return this.debugHudVisible;
   }
 
   /** Рисует все визуальные элементы. */
@@ -94,10 +139,14 @@ class FrameRenderer {
     selection,
     trackedRect = null,
     ptzCommand,
+    motionDiagnostics = null,
     metadata = {},
   }) {
     if (selection?.state === 'DETECTION_ONLY') {
       this.drawDetections(frame, detections);
+      if (this.debugHudVisible) {
+        this.drawMotionDiagnostics(frame, motionDiagnostics, 10, 10);
+      }
       return frame;
     }
 
@@ -114,9 +163,63 @@ class FrameRenderer {
       selection?.targetCenter ?? null,
       selection?.targetId ?? null,
     );
-    this.drawStatus(frame, selection, ptzCommand, metadata);
+    if (this.debugHudVisible) {
+      this.drawStatus(
+        frame,
+        selection,
+        ptzCommand,
+        metadata,
+        motionDiagnostics,
+      );
+    }
 
     return frame;
+  }
+
+  /**
+   * Минимальный Motion Diagnostics HUD для режима DETECTION_ONLY, где
+   * основной status HUD намеренно не рисуется.
+   */
+  drawMotionDiagnostics(frame, diagnostics, x = 10, y = 10) {
+    if (!diagnostics?.enabled || !diagnostics?.hudEnabled) return;
+
+    const f = diagnostics.frame ?? {};
+    const r = f.rejected ?? {};
+    const p = diagnostics.pipeline ?? {};
+
+    frame.drawRectangle(
+      new cv.Point2(x, y),
+      new cv.Point2(Math.min(this.frameWidth - 10, x + 760), y + 92),
+      this.colors.black,
+      -1,
+      cv.LINE_8,
+    );
+
+    const lines = [
+      `MOTION contours=${f.contours ?? 0} raw=${p.rawAccepted ?? 0} ` +
+        `stable=${p.stableAccepted ?? 0} ids=${p.objectsWithId ?? 0}`,
+      `REJECT contour=${r.CONTOUR_AREA ?? 0} box=${r.BOX_AREA ?? 0} ` +
+        `w=${r.WIDTH ?? 0} h=${r.HEIGHT ?? 0} asp=${r.ASPECT ?? 0} ` +
+        `max=${r.MAX_AREA ?? 0}`,
+      diagnostics.lastReject
+        ? `LAST ${diagnostics.lastReject.reason} ` +
+          `${Math.round(diagnostics.lastReject.width)}x` +
+          `${Math.round(diagnostics.lastReject.height)} ` +
+          `area=${Math.round(diagnostics.lastReject.area)}`
+        : 'LAST -',
+    ];
+
+    lines.forEach((text, index) => {
+      frame.putText(
+        text,
+        new cv.Point2(x + 10, y + 24 + index * 27),
+        cv.FONT_HERSHEY_SIMPLEX,
+        0.50,
+        index === 0 ? this.colors.yellow : this.colors.orange,
+        1,
+        cv.LINE_AA,
+      );
+    });
   }
 
   /**
@@ -314,7 +417,13 @@ class FrameRenderer {
   }
 
   /** Рисует информационную панель. */
-  drawStatus(frame, selection, ptzCommand, metadata) {
+  drawStatus(
+    frame,
+    selection,
+    ptzCommand,
+    metadata,
+    motionDiagnostics = null,
+  ) {
     const state = selection?.state ?? 'SEARCHING';
     const targetId = selection?.targetId ?? '-';
     const captureType = selection?.captureType ?? 'ALL_OBJECTS';
@@ -322,10 +431,24 @@ class FrameRenderer {
     const tilt = ptzCommand?.tilt ?? 'STOP';
     const errorX = Math.round(ptzCommand?.errorX ?? 0);
     const errorY = Math.round(ptzCommand?.errorY ?? 0);
+    const panSpeed = Number(ptzCommand?.panSpeed ?? 0);
+    const tiltSpeed = Number(ptzCommand?.tiltSpeed ?? 0);
+    const zoomLocked = Boolean(ptzCommand?.zoomLocked);
+    const ptzMode = ptzCommand?.ptzMode ?? 'STOP';
+    const fine = ptzCommand?.fineCentering ?? null;
 
     frame.drawRectangle(
       new cv.Point2(10, 10),
-      new cv.Point2(430, 225),
+      new cv.Point2(
+        790,
+        (this.ptzDebugHudEnabled
+          ? (this.showTrackingModeHud ? 510 : 390)
+          : (this.showTrackingModeHud ? 375 : 255)) +
+          (this.captureDiagnosticsHudEnabled ? 145 : 0) +
+          (motionDiagnostics?.enabled && motionDiagnostics?.hudEnabled
+            ? 85
+            : 0),
+      ),
       this.colors.black,
       -1,
       cv.LINE_8,
@@ -346,19 +469,230 @@ class FrameRenderer {
         targetId === '-' ? this.colors.white : this.colors.green,
       ],
       [`Capture: ${captureType}`, this.colors.red],
-      [`PAN: ${pan}  TILT: ${tilt}`, this.colors.white],
+      [
+        `PAN: ${pan} ${panSpeed.toFixed(2)}  ` +
+        `TILT: ${tilt} ${tiltSpeed.toFixed(2)}`,
+        this.colors.white,
+      ],
       [`Error: X=${errorX} Y=${errorY}`, this.colors.white],
-      ['PTZ: CONSOLE MODE', this.colors.yellow],
+      [
+        fine
+          ? `PTZ MODE: ${ptzMode}  ` +
+            `STOP:${fine.stopErrorX}x${fine.stopErrorY}  ` +
+            `ENTER:${fine.enterErrorX}x${fine.enterErrorY}`
+          : `PTZ MODE: ${ptzMode}`,
+        ptzMode === 'FINE'
+          ? this.colors.green
+          : this.colors.white,
+      ],
+      [
+        zoomLocked
+          ? 'ZOOM: LOCKED DURING TRACKING'
+          : `ZOOM: ${ptzCommand?.zoom ?? 'STOP'}`,
+        zoomLocked ? this.colors.orange : this.colors.yellow,
+      ],
     ];
+
+    if (this.ptzDebugHudEnabled) {
+      const diagnostics = ptzDiagnostics.getSnapshot();
+      const ctrl = diagnostics.controller ?? ptzCommand?.ptzDebug ?? {};
+      const disp = diagnostics.dispatcher ?? {};
+      const drv = diagnostics.driver ?? {};
+
+      const raw = ctrl.raw ?? {};
+      const stable = ctrl.stable ?? {};
+
+      rows.push(
+        [
+          `PTZ RAW: ${raw.pan ?? '-'} ` +
+          `${Number(raw.requestedPanSpeed ?? 0).toFixed(3)} / ` +
+          `${raw.tilt ?? '-'} ` +
+          `${Number(raw.requestedTiltSpeed ?? 0).toFixed(3)}`,
+          this.colors.yellow,
+        ],
+        [
+          `PTZ STABLE: ${stable.pan ?? '-'} ` +
+          `${Number(stable.panSpeed ?? 0).toFixed(3)} / ` +
+          `${stable.tilt ?? '-'} ` +
+          `${Number(stable.tiltSpeed ?? 0).toFixed(3)}`,
+          this.colors.cyan,
+        ],
+        [
+          `DISPATCH: ${disp.stage ?? '-'} ` +
+          `${disp.pan ?? '-'} ${Number(disp.panSpeed ?? 0).toFixed(3)} / ` +
+          `${disp.tilt ?? '-'} ${Number(disp.tiltSpeed ?? 0).toFixed(3)}`,
+          disp.stage === 'SENT'
+            ? this.colors.green
+            : this.colors.white,
+        ],
+        [
+          `DRIVER: ${drv.stage ?? '-'} ${drv.driver ?? '-'} ` +
+          `PAN=${drv.pan ?? '-'} RATE=` +
+          `${Number(drv.panRate ?? 0).toFixed(3)} ` +
+          `TILT=${drv.tilt ?? '-'} RATE=` +
+          `${Number(drv.tiltRate ?? 0).toFixed(3)} ` +
+          `${drv.dryRun ? 'DRY' : ''}`,
+          drv.stage === 'DRY_RUN'
+            ? this.colors.orange
+            : this.colors.white,
+        ],
+      );
+    }
+
+    if (this.showTrackingModeHud) {
+      const trackerState = selection?.trackerState ?? {};
+      const roiState = trackerState.roi ?? {};
+      const enhancement = trackerState.enhancement ?? {};
+      const mode = selection?.trackingMode ?? trackerState.mode ?? 'STANDARD';
+      const trackerType = trackerState.type ?? 'KCF';
+      const roiRect = roiState.rect;
+      const roiText = roiRect
+        ? `${roiRect.width}x${roiRect.height}`
+        : '-';
+      const confidence = Number(trackerState.confidence);
+      const scaleHealth = trackerState.scaleHealth ?? {};
+      const scaleAreaRatio = Number(scaleHealth.areaRatio);
+      const scaleState = scaleHealth.state ?? 'NO_DATA';
+
+      rows.push(
+        [`Tracking: ${mode} / ${trackerType}`, this.colors.green],
+        [
+          `ROI: ${roiText}  RECENTER: ${roiState.recenterCount ?? 0} ` +
+          `CD:${roiState.cooldownRemaining ?? 0}`,
+          this.colors.cyan,
+        ],
+        [
+          `CLAHE:${enhancement.claheEnabled ? 'ON' : 'OFF'} ` +
+          `G:${enhancement.gamma ?? '-'} CONF:` +
+          `${Number.isFinite(confidence) ? confidence.toFixed(2) : '-'}`,
+          Number.isFinite(confidence) && confidence < 0.35
+            ? this.colors.orange
+            : this.colors.white,
+        ],
+        [
+          `SCALE: ${scaleState}  RATIO:` +
+          `${Number.isFinite(scaleAreaRatio)
+            ? scaleAreaRatio.toFixed(2)
+            : '-'} ` +
+          `MATCH:${scaleHealth.matchFrames ?? 0}/` +
+          `${scaleHealth.confirmFrames ?? 0} AUTO:OFF`,
+          ['GROWING', 'SHRINKING'].includes(scaleState)
+            ? this.colors.orange
+            : scaleState === 'STABLE'
+              ? this.colors.green
+              : this.colors.white,
+        ],
+      );
+    }
+
+    if (this.captureDiagnosticsHudEnabled) {
+      const capture = selection?.captureDiagnostics ?? null;
+
+      if (capture?.enabled) {
+        const roi = capture.roi ?? {};
+        const safe = roi.safeArea ?? {};
+        const recenter = capture.lastRecenter ?? null;
+        const attention = capture.attention ?? {};
+        const event = capture.lastEvent ?? null;
+
+        const attentionColor =
+          attention.level === 'ERROR'
+            ? this.colors.red
+            : attention.level === 'WARN'
+              ? this.colors.orange
+              : attention.level === 'OK'
+                ? this.colors.green
+                : this.colors.white;
+
+        rows.push(
+          [
+            `CAPTURE DBG: ID=${capture.targetId ?? '-'} ` +
+            `DET=${capture.targetPresent ? 'YES' : 'NO'} ` +
+            `KCF=${capture.trackerActive ? 'ON' : 'OFF'} ` +
+            `RECT=${capture.trackerRectPresent ? 'YES' : 'NO'}`,
+            capture.trackerRectPresent
+              ? this.colors.green
+              : this.colors.orange,
+          ],
+          [
+            `SAFE: ${safe.outsideSafeArea ? 'OUT' : 'IN'} ` +
+            `SIDE=${safe.side ?? '-'} ` +
+            `OVER=${Number(safe.maxOverflowPx ?? 0).toFixed(1)}px ` +
+            `WARN=${roi.warning ? 'YES' : 'NO'} ` +
+            `${roi.warningFrames ?? 0}/${roi.recenterAfterWarningFrames ?? 0}`,
+            safe.outsideSafeArea
+              ? this.colors.orange
+              : this.colors.green,
+          ],
+          [
+            `RECENTERS: ${roi.recenterCount ?? 0}/` +
+            `${Number(roi.maxRecenters ?? 0) === 0 ? 'INF' : roi.maxRecenters} ` +
+            `CD=${roi.cooldownRemaining ?? 0} ` +
+            (recenter
+              ? `LAST=${recenter.effective ? 'OK' : 'INEFFECTIVE'} ` +
+                `${Number(recenter.beforeOverflowPx ?? 0).toFixed(1)}->` +
+                `${Number(recenter.afterOverflowPx ?? 0).toFixed(1)}px`
+              : 'LAST=-'),
+            recenter?.effective === false
+              ? this.colors.red
+              : this.colors.cyan,
+          ],
+          [
+            `CAPTURE REASON: ${attention.reason ?? 'NO_DATA'}`,
+            attentionColor,
+          ],
+          [
+            event
+              ? `LAST EVENT: ${event.from}->${event.to} ` +
+                `(${event.reason ?? '-'})`
+              : 'LAST EVENT: -',
+            event ? this.colors.yellow : this.colors.white,
+          ],
+        );
+      }
+    }
+
+    if (motionDiagnostics?.enabled && motionDiagnostics?.hudEnabled) {
+      const motionFrame = motionDiagnostics.frame ?? {};
+      const rejected = motionFrame.rejected ?? {};
+      const pipeline = motionDiagnostics.pipeline ?? {};
+      const lastReject = motionDiagnostics.lastReject ?? null;
+
+      rows.push(
+        [
+          `MOTION: contours=${motionFrame.contours ?? 0} ` +
+          `raw=${pipeline.rawAccepted ?? 0} ` +
+          `stable=${pipeline.stableAccepted ?? 0} ` +
+          `ids=${pipeline.objectsWithId ?? 0}`,
+          this.colors.yellow,
+        ],
+        [
+          `MOTION REJECT: contour=${rejected.CONTOUR_AREA ?? 0} ` +
+          `box=${rejected.BOX_AREA ?? 0} ` +
+          `w=${rejected.WIDTH ?? 0} h=${rejected.HEIGHT ?? 0} ` +
+          `asp=${rejected.ASPECT ?? 0} max=${rejected.MAX_AREA ?? 0}`,
+          this.colors.orange,
+        ],
+        [
+          lastReject
+            ? `LAST REJECT: ${lastReject.reason} ` +
+              `${Math.round(lastReject.width)}x${Math.round(lastReject.height)} ` +
+              `area=${Math.round(lastReject.area)} ` +
+              `stage=${lastReject.stage}`
+            : 'LAST REJECT: -',
+          lastReject ? this.colors.orange : this.colors.white,
+        ],
+      );
+    }
 
     rows.forEach(([text, color], index) => {
       frame.putText(
         text,
-        new cv.Point2(20, 35 + index * 29),
+        new cv.Point2(20, 35 + index * 27),
         cv.FONT_HERSHEY_SIMPLEX,
-        index === 6 ? 0.52 : 0.58,
+        index === 6 ? 0.52 : index >= 7 ? 0.50 : 0.58,
         color,
-        index === 6 ? 1 : 2,
+        index === 6 || index >= 7 ? 1 : 2,
         cv.LINE_AA,
       );
     });

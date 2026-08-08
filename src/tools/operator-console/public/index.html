@@ -47,8 +47,7 @@
         </div>
         <span id="panelMode" class="panel-mode">SEARCH</span>
       </div>
-
-      <section id="searchPanel" class="mode-panel">
+<section id="searchPanel" class="mode-panel">
         <div class="section-block">
           <h2>Детектор</h2>
           <dl class="data-list">
@@ -74,6 +73,7 @@
             </select>
           </label>
         </div>
+
 
         <div class="section-block">
           <h2>Управление</h2>
@@ -114,6 +114,85 @@
 
         <button id="resetButton" class="button button--danger button--stop">Прекратить сопровождение</button>
       </section>
+
+      <section class="recording-panel" aria-label="Запис експерименту">
+              <button id="autoRecordToggle" class="recording-panel__toggle" type="button">
+                <span class="recording-panel__title">
+                  <strong>Запис експерименту</strong>
+                  <small>Автозапис при захопленні · F8</small>
+                </span>
+                <span class="recording-panel__status">
+                  <span id="recordingState" class="recording-state" data-state="off">OFF</span>
+                  <input id="autoRecordCheckbox" type="checkbox" tabindex="-1" aria-hidden="true">
+                </span>
+              </button>
+              <dl class="data-list recording-panel__data">
+                <div><dt>Тривалість</dt><dd id="recordingTimer">00:00</dd></div>
+                <div><dt>Після втрати</dt><dd id="recordingPostRoll">5 с</dd></div>
+                <div><dt>Файл</dt><dd id="recordingFile">—</dd></div>
+              </dl>
+
+              <button id="stopRecordingButton"
+                      class="button button--danger recording-stop-button"
+                      type="button"
+                      disabled>
+                Зупинити запис
+              </button>
+              <div id="recordingConfigHint" class="recording-hint"></div>
+            </section>
+
+
+
+
+      <details id="observationSettings" class="observation-settings" open>
+        <summary>
+          <span>
+            <strong>Режим наблюдения</strong>
+            <small>Только визуальный канал оператора; аналитика получает ORIGINAL</small>
+          </span>
+          <span id="observationModeState" class="observation-settings__state">Загрузка…</span>
+        </summary>
+
+        <div id="observationModeButtons" class="observation-mode-buttons">
+          <button
+            class="button observation-button"
+            data-observation-mode="ORIGINAL"
+            type="button"
+          >Основной</button>
+
+          <button
+            class="button observation-button"
+            data-observation-mode="CLAHE"
+            type="button"
+          >CLAHE</button>
+
+          <button
+            class="button observation-button"
+            data-observation-mode="CLAHE_SHARPEN"
+            type="button"
+          >CLAHE + резкость</button>
+        </div>
+
+        <p class="observation-settings__hint">
+          Эти режимы меняют только наблюдаемую картинку. Motion, KCF и PTZ
+          продолжают работать по исходному кадру.
+        </p>
+      </details>
+
+      <details class="motion-settings" open>
+        <summary>
+          <span>
+            <strong>Motion Detector</strong>
+            <small>Runtime-настройки через /api/config</small>
+          </span>
+          <span id="motionSettingsSummary" class="motion-settings__summary">—</span>
+        </summary>
+        <div id="motionSettingsList" class="motion-settings__list"></div>
+        <div class="motion-settings__actions">
+          <button id="reloadMotionSettings" class="button button--small">Перечитать</button>
+          <button id="resetMotionOverrides" class="button button--small">Сбросить override</button>
+        </div>
+      </details>
 
       <details class="diagnostics">
         <summary>Инженерная диагностика</summary>

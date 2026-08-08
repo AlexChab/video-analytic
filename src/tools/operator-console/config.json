@@ -1,9 +1,14 @@
 {
-  "consoleHost": "127.0.0.1",
+  "consoleHost": "192.168.30.218",
   "consolePort": 8090,
-  "trackingApi": "http://127.0.0.1:8081",
+  "trackingApi": "http://192.168.30.218:8081",
   "refreshMs": 500,
   "frameWidth": 1920,
   "frameHeight": 1080,
-  "requestTimeoutMs": 3000
+  "requestTimeoutMs": 3000,
+  "recordingPostRollSec": 5,
+  "recordingFps": 10,
+  "recordingRtspUrl": "rtsp://192.168.1.101:554/video1",
+  "recordingRtspTransport": "tcp",
+  "ffmpegPath": "ffmpeg"
 }

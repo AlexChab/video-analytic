@@ -1,6 +1,5 @@
 'use strict';
 
-
 const logger = require('./utils/Logger');
 /**
  * Добавляем каталог с DLL OpenCV в PATH.
@@ -30,6 +29,7 @@ const path = require('node:path');
 const cv = require('@u4/opencv4nodejs');
 const config = require('./config/camera.config');
 const trackingConfig = require('./config/tracking.config');
+const observationConfig = require('./config/observation.config');
 const ProfileManager = require('./config/ProfileManager');
 const RtspReader = require('./video/RtspReader');
 const FrameParser = require('./video/FrameParser');
@@ -42,6 +42,7 @@ const camerasConfig = require('./config/cameras.config');
 const CameraRegistry = require('./camera/CameraRegistry');
 const CameraDriverFactory = require('./camera/CameraDriverFactory');
 const CameraCommandDispatcher = require('./camera/CameraCommandDispatcher');
+const ConnectionStatusRenderer = require('./ui/ConnectionStatusRenderer');
 
 /**
  * Буфер хранит только последний полученный кадр.
@@ -57,14 +58,16 @@ const manualTrackingControl = new ManualTrackingControl();
 /** Реестр связывает физическую камеру, RTSP-поток и драйвер управления. */
 const cameraRegistry = new CameraRegistry(camerasConfig);
 const activeCameraBinding = cameraRegistry.getActiveBinding();
-const activeCameraControl = activeCameraBinding.device.control ?? {};
+const activeCameraControl = activeCameraBinding.control ?? {};
 
 /**
  * На первом этапе используется безопасный ConsoleCameraDriver.
  * Для реальной камеры меняется только CAMERA_CONTROL_DRIVER и реализация драйвера.
  */
 const cameraDriver = CameraDriverFactory.create(
-  activeCameraControl.enabled === false ? 'console' : activeCameraControl.driver,
+  activeCameraBinding.controlEnabled
+    ? activeCameraBinding.controlDriverName
+    : 'console',
   activeCameraControl.options ?? {},
 );
 const cameraCommandDispatcher = new CameraCommandDispatcher({
@@ -74,9 +77,10 @@ const cameraCommandDispatcher = new CameraCommandDispatcher({
 cameraCommandDispatcher.start();
 logger.info(
   `[CAMERA] Активная камера=${activeCameraBinding.device.id}; ` +
-  `поток=${activeCameraBinding.stream.id}; ` +
-  `управление=${activeCameraControl.enabled === false ? 'выключено' : 'включено'}; ` +
-  `driver=${cameraDriver.constructor.name}`,
+    `поток=${activeCameraBinding.stream.id}; ` +
+    `source=${activeCameraBinding.sourceId}; ` +
+    `управление=${activeCameraBinding.controlEnabled ? 'включено' : 'выключено'}; ` +
+    `driver=${cameraDriver.constructor.name}`,
 );
 
 /**
@@ -104,6 +108,15 @@ profileManager.initialize();
  * - cv.destroyWindow().
  */
 const previewWindowName = 'Video Analytics - Motion Detection';
+
+/**
+ * Отдельный renderer служебного экрана отсутствующего потока.
+ * Он не участвует в обработке видеокадров и не копирует рабочие Mat.
+ */
+const connectionStatusRenderer = new ConnectionStatusRenderer({
+  width: config.frame.width,
+  height: config.frame.height,
+});
 /**
  * Создаём окно заранее, чтобы оно было масштабируемым.
  */
@@ -126,6 +139,24 @@ let lastDataReceivedAt = Date.now();
  * а именно готовый кадр размером width × height × 3.
  */
 let lastFrameReceivedAt = null;
+
+/** Показывает, что за время текущего запуска был получен хотя бы один кадр. */
+let hasReceivedFrameEver = false;
+
+/**
+ * Последний реально отображённый обработанный кадр.
+ *
+ * Ссылка нужна только UI-контуру. При пропадании потока renderer один раз
+ * клонирует этот Mat и создаёт стоп-кадр с небольшой плашкой. В аналитический
+ * конвейер стоп-кадр никогда не передаётся.
+ */
+let lastDisplayedLiveFrame = null;
+
+/** Показывает, что сейчас в окне отображается замороженный кадр. */
+let freezeFrameVisible = false;
+
+/** Момент запланированной следующей попытки запуска FFmpeg. */
+let readerRestartDueAt = null;
 
 /**
  * Таймер отложенного перезапуска FFmpeg.
@@ -255,6 +286,7 @@ const frameProcessor = new FrameProcessor({
   manualControl: manualTrackingControl,
   cameraCommandDispatcher,
   cameraControlConfig: activeCameraControl.axes ?? {},
+  observationConfig,
 });
 /** HTTP API выбора цели по ID или координатам исходного RTSP-кадра. */
 const trackingApiServer = new TrackingApiServer({
@@ -262,6 +294,7 @@ const trackingApiServer = new TrackingApiServer({
   port: trackingConfig.apiPort,
   control: manualTrackingControl,
   profileManager,
+  observationEnhancer: frameProcessor.getObservationEnhancer(),
   frameWidth: config.frame.width,
   frameHeight: config.frame.height,
 });
@@ -535,7 +568,17 @@ function showPreviewFrame(frame) {
      * - клавиатуры;
      * - закрытия окна.
      */
-    const pressedKey = cv.waitKey(1);
+    const pressedKey =
+      typeof cv.waitKeyEx === 'function'
+        ? cv.waitKeyEx(1)
+        : cv.waitKey(1);
+
+    /*
+     * Инженерные окна используют тот же HighGUI event loop.
+     * Motion Inspector не вызывает собственный waitKey(), иначе два окна
+     * начали бы конкурировать за клавиатурные события.
+     */
+    frameProcessor?.handleKey?.(pressedKey);
 
     /**
      * Код клавиши ESC равен 27.
@@ -577,91 +620,6 @@ function showPreviewFrame(frame) {
 /**
  * Обрабатываем каждый полностью собранный кадр.
  */
-// parser.on('frame', async (frameBuffer, metadata) => {
-//   if (shuttingDown) {
-//     return;
-//   }
-
-//   /**
-//    * Если предыдущий кадр ещё обрабатывается,
-//    * пропускаем текущий.
-//    *
-//    * Это не даёт накапливаться очереди кадров
-//    * и увеличиваться задержке видеопотока.
-//    */
-//   if (processingFrame) {
-//     return;
-//   }
-
-//   processingFrame = true;
-
-//   totalFrames += 1;
-//   framesSinceLastReport += 1;
-
-//   try {
-//     let processingResult;
-
-//     try {
-//       processingResult = frameProcessor.process(frameBuffer, metadata);
-//     } catch (error) {
-//       logger.error(
-//         `[OpenCV] Ошибка обработки кадра ` + `${metadata.number}:`,
-//         error.message,
-//       );
-
-//       return;
-//     }
-
-//     /**
-//      * Выводим обработанный кадр.
-//      */
-//     const previewResult = showPreviewFrame(processingResult.frame);
-
-//     /**
-//      * ESC завершает работу всего приложения.
-//      */
-//     if (previewResult === 'shutdown') {
-//       shutdown('ESC');
-//       return;
-//     }
-
-//     const processedFrame = processingResult.frameBuffer;
-
-//     /**
-//      * Сохраняем первый кадр после успешного
-//      * захвата цели.
-//      */
-//     if (
-//       processingResult.tracking.state === 'TRACKING' &&
-//       !firstFrameSaved &&
-//       !savingFirstFrame
-//     ) {
-//       savingFirstFrame = true;
-
-//       try {
-//         await saveFrameAsJpeg({
-//           ffmpegPath: config.ffmpegPath,
-//           frameBuffer: processedFrame,
-//           width: metadata.width,
-//           height: metadata.height,
-//           outputPath: testFramePath,
-//         });
-
-//         firstFrameSaved = true;
-
-//         logger.info(
-//           '[Видео] Кадр с захваченной целью ' + `сохранён: ${testFramePath}`,
-//         );
-//       } catch (error) {
-//         logger.error('[Видео] Ошибка сохранения кадра:', error.message);
-//       } finally {
-//         savingFirstFrame = false;
-//       }
-//     }
-//   } finally {
-//     processingFrame = false;
-//   }
-// });
 
 /**
  * FrameParser по-прежнему собирает все кадры из бинарного потока,
@@ -675,6 +633,7 @@ parser.on('frame', (frameBuffer, metadata) => {
   totalFrames += 1;
   framesSinceLastReport += 1;
   lastFrameReceivedAt = Date.now();
+  hasReceivedFrameEver = true;
   /**
    * Новый кадр заменяет предыдущий ожидающий кадр.
    *
@@ -749,7 +708,17 @@ async function processLatestFrame() {
 
     /**
      * Отображаем обработанный видеокадр.
+     *
+     * Важно: сохраняем только ссылку на последний реально обработанный Mat.
+     * Никакого clone/copy в режиме LIVE не выполняется.
      */
+    lastDisplayedLiveFrame = processingResult.frame;
+
+    if (freezeFrameVisible) {
+      connectionStatusRenderer.clearFrozenFrame();
+      freezeFrameVisible = false;
+    }
+
     const previewResult = showPreviewFrame(processingResult.frame);
 
     if (previewResult === 'shutdown') {
@@ -822,6 +791,7 @@ function scheduleReaderRestart(reason) {
   }
 
   readerRestartScheduled = true;
+  readerRestartDueAt = Date.now() + 2000;
   lastRestartReason = reason;
 
   logger.warn(`[RTSP] Перезапуск FFmpeg через 2 сек. Причина: ${reason}.`);
@@ -834,6 +804,7 @@ function scheduleReaderRestart(reason) {
 
   readerRestartTimer = setTimeout(() => {
     readerRestartTimer = null;
+    readerRestartDueAt = null;
 
     if (shuttingDown) {
       readerRestartScheduled = false;
@@ -903,6 +874,73 @@ reader.on('close', ({ code, signal, expected }) => {
 
   scheduleReaderRestart('неожиданное завершение FFmpeg');
 });
+
+/**
+ * Обновляет окно OpenCV только в периоды, когда свежего видео нет.
+ *
+ * В режиме LIVE этот таймер ничего не рисует: обработанный кадр идёт по
+ * прежнему быстрому пути FrameProcessor -> showPreviewFrame(). Поэтому
+ * дополнительного копирования и нагрузки на аналитику не появляется.
+ */
+const streamStatusTimer = setInterval(() => {
+  if (shuttingDown || !previewWindowEnabled) {
+    return;
+  }
+
+  const now = Date.now();
+  const lastFrameAgeMs =
+    lastFrameReceivedAt === null ? null : now - lastFrameReceivedAt;
+
+  // Пока кадры свежие, окно обновляет только основной видеоконвейер.
+  if (lastFrameAgeMs !== null && lastFrameAgeMs < 1200) {
+    return;
+  }
+
+  const readerStats = reader.getStats();
+  const state = hasReceivedFrameEver ? 'STREAM_LOST' : 'WAITING_FOR_STREAM';
+  const retryInMs =
+    readerRestartDueAt === null ? null : Math.max(0, readerRestartDueAt - now);
+
+  const status = {
+    state,
+    source: activeCameraBinding.stream.rtspUrl || config.camera.safeRtspUrl,
+    attempt: readerStats.starts,
+    retryInMs,
+    lastFrameAgeMs,
+    ffmpegRunning: readerStats.running,
+    ptzEnabled: activeCameraControl.enabled !== false,
+  };
+
+  let displayFrame;
+
+  if (state === 'STREAM_LOST' && lastDisplayedLiveFrame) {
+    /**
+     * После потери уже работавшего потока сохраняем последний реальный кадр
+     * и рисуем поверх него только компактную UI-плашку.
+     *
+     * Клонирование происходит один раз при переходе LIVE -> STREAM_LOST.
+     * На последующих тиках переиспользуется тот же замороженный Mat.
+     */
+    displayFrame = connectionStatusRenderer.renderFrozen(
+      lastDisplayedLiveFrame,
+      status,
+    );
+
+    freezeFrameVisible = true;
+  } else {
+    /**
+     * До получения самого первого кадра стоп-кадра ещё нет, поэтому остаётся
+     * отдельный полноэкранный экран ожидания.
+     */
+    displayFrame = connectionStatusRenderer.renderWaiting(status);
+  }
+
+  const previewResult = showPreviewFrame(displayFrame);
+
+  if (previewResult === 'shutdown') {
+    shutdown('ESC');
+  }
+}, 250);
 
 /**
  * Раз в секунду выводим реальное количество
@@ -1052,11 +1090,13 @@ function shutdown(signal) {
    * Останавливаем периодический вывод FPS.
    */
   clearInterval(fpsTimer);
+  clearInterval(streamStatusTimer);
 
   if (readerRestartTimer !== null) {
     clearTimeout(readerRestartTimer);
     readerRestartTimer = null;
   }
+  readerRestartDueAt = null;
   readerRestartScheduled = false;
 
   /**

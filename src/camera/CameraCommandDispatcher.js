@@ -1,6 +1,7 @@
 'use strict';
 
 const logger = require('../utils/Logger');
+const ptzDiagnostics = require('./PtzDiagnosticsStore');
 
 /**
  * Неблокирующий диспетчер команд камеры.
@@ -72,6 +73,20 @@ class CameraCommandDispatcher {
 
     if (this.pendingCommand) this.stats.replaced += 1;
     this.pendingCommand = normalized;
+
+    ptzDiagnostics.updateDispatcher({
+      stage: 'SUBMITTED',
+      accepted: true,
+      pending: true,
+      processing: this.processing,
+      pan: normalized.pan,
+      tilt: normalized.tilt,
+      panSpeed: normalized.panSpeed,
+      tiltSpeed: normalized.tiltSpeed,
+      reason: normalized.reason ?? 'UNKNOWN',
+      submittedAt: Date.now(),
+    });
+
     this.#scheduleDrain(0);
     return true;
   }
@@ -160,6 +175,19 @@ class CameraCommandDispatcher {
 
     if (!command.force && key === this.lastSentKey && !repeatElapsed) {
       this.stats.suppressed += 1;
+
+      ptzDiagnostics.updateDispatcher({
+        stage: 'SUPPRESSED',
+        pending: Boolean(this.pendingCommand),
+        processing: this.processing,
+        pan: command.pan,
+        tilt: command.tilt,
+        panSpeed: command.panSpeed,
+        tiltSpeed: command.tiltSpeed,
+        reason: command.reason ?? 'UNKNOWN',
+        suppressedAt: Date.now(),
+      });
+
       if (this.pendingCommand) this.#scheduleDrain(0);
       return;
     }
@@ -174,6 +202,18 @@ class CameraCommandDispatcher {
       this.stats.sent += 1;
       this.lastSentKey = key;
       this.lastSentAt = Date.now();
+
+      ptzDiagnostics.updateDispatcher({
+        stage: 'SENT',
+        pending: Boolean(this.pendingCommand),
+        processing: false,
+        pan: command.pan,
+        tilt: command.tilt,
+        panSpeed: command.panSpeed,
+        tiltSpeed: command.tiltSpeed,
+        reason: command.reason ?? 'UNKNOWN',
+        sentAt: this.lastSentAt,
+      });
     } catch (error) {
       if (error?.code === 'CAMERA_COMMAND_TIMEOUT') this.stats.timeouts += 1;
       else this.stats.errors += 1;

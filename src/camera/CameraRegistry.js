@@ -1,5 +1,7 @@
 'use strict';
 
+const RuntimeSourceBinding = require('./RuntimeSourceBinding');
+
 /** Связывает физическое устройство, его RTSP-потоки и драйвер управления. */
 class CameraRegistry {
   constructor(configuration) {
@@ -30,7 +32,15 @@ class CameraRegistry {
     if (!stream) {
       throw new Error(`Поток ${streamId} не найден у камеры ${device.id}`);
     }
-    return { device, stream };
+    const control = stream.control ?? device.control ?? null;
+
+    return new RuntimeSourceBinding({
+      sourceId: stream.sourceId ?? `${device.id}:${stream.id}`,
+      device,
+      stream,
+      control,
+      origin: 'STATIC_REGISTRY',
+    });
   }
 
   getActiveBinding() {
@@ -46,7 +56,15 @@ class CameraRegistry {
       name: device.name,
       manufacturer: device.manufacturer,
       model: device.model,
-      streams: (device.streams ?? []).map((stream) => ({ ...stream })),
+      streams: (device.streams ?? []).map((stream) => ({
+        ...stream,
+        controlDriver:
+          stream.control?.driver ??
+          device.control?.driver ??
+          null,
+        controlEnabled:
+          (stream.control ?? device.control)?.enabled !== false,
+      })),
       controlDriver: device.control?.driver ?? null,
     }));
   }

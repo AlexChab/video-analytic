@@ -19,5 +19,12 @@ export const state = {
   lastLatencyMs: null,
   lastUpdatedAt: null,
   lastStatusCode: null,
-  intelligenceSources: []
+  intelligenceSources: [],
+  recording: {
+    autoEnabled: false,
+    recording: false,
+    pendingStop: false,
+    postRollSec: 5,
+    current: null
+  }
 };

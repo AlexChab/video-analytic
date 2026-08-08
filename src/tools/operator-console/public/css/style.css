@@ -164,3 +164,136 @@ select { min-width: 104px; padding: 7px; color: #e8eef7; border: 1px solid #3546
   .console-layout { grid-template-columns: minmax(650px, 3fr) 340px; }
   .statusbar { gap: 12px; }
 }
+
+
+/* Operator Console 2.1 — runtime-настройки Motion Detector */
+.motion-settings { margin: 0 10px 10px; border: 1px solid #2b3c52; background: #0d1722; }
+.motion-settings > summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 12px; cursor: pointer; }
+.motion-settings > summary strong { display: block; font-size: 13px; }
+.motion-settings > summary small { display: block; margin-top: 3px; color: #718096; font-size: 10px; }
+.motion-settings__summary { color: #7fb9ff; font: 10px Consolas, monospace; }
+.motion-settings__list { display: flex; flex-direction: column; gap: 1px; border-top: 1px solid #202c3c; }
+.motion-settings-loading, .motion-settings-error { padding: 14px; color: #8290a2; font-size: 12px; }
+.motion-settings-error { color: #ff7d86; }
+.motion-control { padding: 9px 11px; background: #101b29; border-left: 3px solid transparent; }
+.motion-control[data-state="saving"] { border-left-color: #dba63d; }
+.motion-control[data-state="saved"] { border-left-color: #35d07f; }
+.motion-control[data-state="error"] { border-left-color: #ff5967; }
+.motion-control__heading, .motion-control__footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.motion-control__heading label { font-size: 12px; font-weight: 650; }
+.motion-control__path { color: #65758a; font: 9px Consolas, monospace; }
+.motion-control__inputs { display: grid; grid-template-columns: minmax(0, 1fr) 70px; gap: 9px; align-items: center; margin-top: 7px; }
+.motion-control input[type="range"] { width: 100%; accent-color: #50a8ff; }
+.motion-control__number { width: 70px; padding: 5px 6px; border: 1px solid #35465f; color: #e8eef7; background: #0b141f; font: 11px Consolas, monospace; }
+.motion-control__footer { min-height: 14px; margin-top: 3px; color: #65758a; font: 9px Consolas, monospace; }
+.motion-control__status { max-width: 155px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.motion-control[data-state="saved"] .motion-control__status { color: #61e79e; }
+.motion-control[data-state="error"] .motion-control__status { color: #ff7d86; }
+.motion-control--switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer; }
+.motion-control--switch strong { display: block; font-size: 12px; }
+.motion-control--switch small { display: block; margin-top: 3px; color: #65758a; font: 9px Consolas, monospace; }
+.motion-switch-wrap { display: flex; align-items: center; gap: 8px; }
+.motion-control--switch input { width: 34px; height: 18px; accent-color: #35d07f; }
+.motion-settings__actions { display: flex; justify-content: flex-end; gap: 7px; padding: 8px; border-top: 1px solid #202c3c; }
+
+
+
+/* Operator Console — отдельные режимы визуального наблюдения */
+.observation-settings {
+  margin: 0 10px 10px;
+  border: 1px solid #31506f;
+  background: #0d1825;
+}
+
+.observation-settings > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 12px;
+  cursor: pointer;
+}
+
+.observation-settings > summary strong {
+  display: block;
+  font-size: 13px;
+}
+
+.observation-settings > summary small {
+  display: block;
+  margin-top: 3px;
+  color: #718096;
+  font-size: 10px;
+}
+
+.observation-settings__state {
+  color: #7fbdff;
+  text-align: right;
+  font: 10px Consolas, monospace;
+}
+
+.observation-mode-buttons {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+  padding: 10px;
+  border-top: 1px solid #202c3c;
+}
+
+.observation-button {
+  min-width: 0;
+  padding: 9px 6px;
+  font-size: 11px;
+}
+
+.observation-button--active {
+  border-color: #35d07f;
+  color: #75efad;
+  background: #123523;
+  box-shadow: inset 0 0 0 1px rgba(53, 208, 127, .2);
+}
+
+.observation-settings__hint {
+  margin: 0;
+  padding: 0 11px 11px;
+  color: #77879a;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.recording-state { padding:3px 8px; border:1px solid #33465d; border-radius:12px; font-size:11px; }
+.recording-state[data-state="armed"] { color:#ffd166; }
+.recording-state[data-state="rec"] { color:#ff6b6b; border-color:#ff6b6b; }
+.recording-state[data-state="post"] { color:#ffb86c; }
+.recording-hint { margin-top:6px; font-size:11px; color:#8391a7; }
+
+/* AUTO REC v3: permanent operator control */
+.recording-panel {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border: 1px solid #26384d;
+  background: #0b1522;
+}
+.recording-panel__toggle {
+  width: 100%; display:flex; align-items:center; justify-content:space-between; gap:12px;
+  padding:0; border:0; background:transparent; color:inherit; text-align:left; cursor:pointer;
+}
+.recording-panel__toggle:hover { background: rgba(255,255,255,.025); }
+.recording-panel__title { display:flex; flex-direction:column; gap:3px; }
+.recording-panel__title strong { color:#f1f6ff; }
+.recording-panel__title small { color:#8291a7; font-size:11px; }
+.recording-panel__status { display:flex; align-items:center; gap:8px; }
+#autoRecordCheckbox { width:16px; height:16px; pointer-events:none; }
+.recording-panel__data { margin-top:10px; }
+.recording-panel__toggle[data-state="rec"] .recording-state { color:#ff6b6b; border-color:#ff6b6b; }
+.recording-panel__toggle[data-state="armed"] .recording-state { color:#ffd166; }
+.recording-panel__toggle[data-state="post"] .recording-state { color:#ffb86c; }
+
+.recording-stop-button {
+  width: 100%;
+  margin-top: 10px;
+}
+.recording-stop-button:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}

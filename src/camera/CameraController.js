@@ -2,6 +2,10 @@
 
 const logger = require('../utils/Logger');
 const KalmanTargetFilter = require('../tracking/KalmanTargetFilter');
+const FineCenteringController = require(
+  '../tracking/FineCenteringController',
+);
+const ptzDiagnostics = require('./PtzDiagnosticsStore');
 
 /**
  * Универсальный контроллер наведения камеры по координатам цели.
@@ -28,6 +32,12 @@ class CameraController {
     maxPanSpeed = 1,
     minTiltSpeed = 0.15,
     maxTiltSpeed = 1,
+    panSpeedSlewLimit = 1,
+    tiltSpeedSlewLimit = 1,
+    zoomLockedDuringTracking = true,
+    fineCentering = {},
+    ptzDebugLogEnabled = false,
+    ptzDebugLogIntervalMs = 500,
     invertPan = false,
     invertTilt = false,
   }) {
@@ -46,6 +56,10 @@ class CameraController {
       measurementNoise: kalmanMeasurementNoise,
     });
 
+    this.fineCenteringController = new FineCenteringController(
+      fineCentering,
+    );
+
     this.updateConfiguration({
       deadZoneX,
       deadZoneY,
@@ -55,9 +69,23 @@ class CameraController {
       maxPanSpeed,
       minTiltSpeed,
       maxTiltSpeed,
+      panSpeedSlewLimit,
+      tiltSpeedSlewLimit,
+      zoomLockedDuringTracking,
+      fineCentering,
+      ptzDebugLogEnabled,
+      ptzDebugLogIntervalMs,
       invertPan,
       invertTilt,
     });
+
+    /**
+     * Последние фактически выданные скорости нужны только для ограничения
+     * резкого изменения команды. Направление STOP сбрасывает соответствующую
+     * скорость немедленно.
+     */
+    this.previousPanSpeed = 0;
+    this.previousTiltSpeed = 0;
   }
 
   updateConfiguration(configuration = {}) {
@@ -89,6 +117,51 @@ class CameraController {
     this.maxTiltSpeed = this.#clampSpeed(
       configuration.maxTiltSpeed ?? this.maxTiltSpeed ?? 1,
     );
+
+    this.panSpeedSlewLimit = this.#clampSpeed(
+      configuration.panSpeedSlewLimit ??
+      this.panSpeedSlewLimit ??
+      1,
+    );
+
+    this.tiltSpeedSlewLimit = this.#clampSpeed(
+      configuration.tiltSpeedSlewLimit ??
+      this.tiltSpeedSlewLimit ??
+      1,
+    );
+
+    this.zoomLockedDuringTracking = Boolean(
+      configuration.zoomLockedDuringTracking ??
+      this.zoomLockedDuringTracking ??
+      true,
+    );
+
+    if (configuration.fineCentering) {
+      this.fineCenteringController.updateConfiguration(
+        configuration.fineCentering,
+      );
+    }
+
+    this.ptzDebugLogEnabled = Boolean(
+      configuration.ptzDebugLogEnabled ??
+      this.ptzDebugLogEnabled ??
+      false,
+    );
+
+    const debugInterval = Number(
+      configuration.ptzDebugLogIntervalMs ??
+      this.ptzDebugLogIntervalMs ??
+      500,
+    );
+    this.ptzDebugLogIntervalMs = Number.isFinite(debugInterval)
+      ? Math.max(50, Math.round(debugInterval))
+      : 500;
+
+    ptzDiagnostics.configure({
+      logEnabled: this.ptzDebugLogEnabled,
+      logIntervalMs: this.ptzDebugLogIntervalMs,
+    });
+
     this.invertPan = Boolean(configuration.invertPan ?? this.invertPan ?? false);
     this.invertTilt = Boolean(configuration.invertTilt ?? this.invertTilt ?? false);
 
@@ -105,6 +178,13 @@ class CameraController {
       maxPanSpeed: this.maxPanSpeed,
       minTiltSpeed: this.minTiltSpeed,
       maxTiltSpeed: this.maxTiltSpeed,
+      panSpeedSlewLimit: this.panSpeedSlewLimit,
+      tiltSpeedSlewLimit: this.tiltSpeedSlewLimit,
+      zoomLockedDuringTracking: this.zoomLockedDuringTracking,
+      fineCentering:
+        this.fineCenteringController.getConfiguration(),
+      ptzDebugLogEnabled: this.ptzDebugLogEnabled,
+      ptzDebugLogIntervalMs: this.ptzDebugLogIntervalMs,
       invertPan: this.invertPan,
       invertTilt: this.invertTilt,
     };
@@ -131,47 +211,108 @@ class CameraController {
 
     const errorX = controlPoint.x - this.frameCenter.x;
     const errorY = controlPoint.y - this.frameCenter.y;
-    const panDirection = this.#axisDirection(
+
+    /*
+     * FineCentering рассматривается раньше обычной dead zone.
+     * Поэтому ошибка Y=18 больше не превращается в STOP только из-за
+     * общей deadZoneY=70.
+     */
+    const fineDecision = this.fineCenteringController.evaluate(
       errorX,
-      this.deadZoneX,
-      'LEFT',
-      'RIGHT',
-      this.invertPan,
-    );
-    const tiltDirection = this.#axisDirection(
       errorY,
-      this.deadZoneY,
-      'UP',
-      'DOWN',
-      this.invertTilt,
     );
 
-    const panSpeed = panDirection === 'STOP'
-      ? 0
-      : this.#calculateAxisSpeed(
-        Math.abs(errorX),
+    let panDirection;
+    let tiltDirection;
+    let requestedPanSpeed;
+    let requestedTiltSpeed;
+
+    if (fineDecision.mode === 'FINE') {
+      panDirection = fineDecision.panActive
+        ? this.#directionBySign(
+          errorX,
+          'LEFT',
+          'RIGHT',
+          this.invertPan,
+        )
+        : 'STOP';
+
+      tiltDirection = fineDecision.tiltActive
+        ? this.#directionBySign(
+          errorY,
+          'UP',
+          'DOWN',
+          this.invertTilt,
+        )
+        : 'STOP';
+
+      requestedPanSpeed = fineDecision.panSpeed;
+      requestedTiltSpeed = fineDecision.tiltSpeed;
+    } else {
+      panDirection = this.#axisDirection(
+        errorX,
         this.deadZoneX,
-        this.frameWidth / 2,
-        this.minPanSpeed,
-        this.maxPanSpeed,
-      );
-    const tiltSpeed = tiltDirection === 'STOP'
-      ? 0
-      : this.#calculateAxisSpeed(
-        Math.abs(errorY),
-        this.deadZoneY,
-        this.frameHeight / 2,
-        this.minTiltSpeed,
-        this.maxTiltSpeed,
+        'LEFT',
+        'RIGHT',
+        this.invertPan,
       );
 
-    return {
+      tiltDirection = this.#axisDirection(
+        errorY,
+        this.deadZoneY,
+        'UP',
+        'DOWN',
+        this.invertTilt,
+      );
+
+      requestedPanSpeed = panDirection === 'STOP'
+        ? 0
+        : this.#calculateAxisSpeed(
+          Math.abs(errorX),
+          this.deadZoneX,
+          this.frameWidth / 2,
+          this.minPanSpeed,
+          this.maxPanSpeed,
+        );
+
+      requestedTiltSpeed = tiltDirection === 'STOP'
+        ? 0
+        : this.#calculateAxisSpeed(
+          Math.abs(errorY),
+          this.deadZoneY,
+          this.frameHeight / 2,
+          this.minTiltSpeed,
+          this.maxTiltSpeed,
+        );
+    }
+
+    const panSpeed = this.#limitSpeedChange(
+      requestedPanSpeed,
+      this.previousPanSpeed,
+      this.panSpeedSlewLimit,
+      panDirection === 'STOP',
+    );
+
+    const tiltSpeed = this.#limitSpeedChange(
+      requestedTiltSpeed,
+      this.previousTiltSpeed,
+      this.tiltSpeedSlewLimit,
+      tiltDirection === 'STOP',
+    );
+
+    this.previousPanSpeed = panSpeed;
+    this.previousTiltSpeed = tiltSpeed;
+
+    const command = {
       pan: panDirection,
       tilt: tiltDirection,
       zoom: 'STOP',
       panSpeed,
       tiltSpeed,
       zoomSpeed: 0,
+      zoomLocked: this.zoomLockedDuringTracking,
+      requestedPanSpeed,
+      requestedTiltSpeed,
       errorX,
       errorY,
       moving: panDirection !== 'STOP' || tiltDirection !== 'STOP',
@@ -180,8 +321,43 @@ class CameraController {
       controlPoint,
       velocity: { x: filtered.vx, y: filtered.vy },
       kalmanEnabled: this.kalmanEnabled,
-      reason: 'TRACKING',
+      ptzMode: fineDecision.mode,
+      fineCentering: fineDecision,
+      reason:
+        fineDecision.mode === 'FINE'
+          ? 'FINE_CENTERING'
+          : 'TRACKING',
     };
+
+    command.ptzDebug = {
+      mode: fineDecision.mode,
+      errorX: Number(errorX.toFixed(2)),
+      errorY: Number(errorY.toFixed(2)),
+      deadZoneX: this.deadZoneX,
+      deadZoneY: this.deadZoneY,
+      raw: {
+        pan: panDirection,
+        tilt: tiltDirection,
+        requestedPanSpeed: Number(requestedPanSpeed.toFixed(4)),
+        requestedTiltSpeed: Number(requestedTiltSpeed.toFixed(4)),
+      },
+      stable: {
+        pan: panDirection,
+        tilt: tiltDirection,
+        panSpeed: Number(panSpeed.toFixed(4)),
+        tiltSpeed: Number(tiltSpeed.toFixed(4)),
+      },
+      fine: fineDecision,
+    };
+
+    ptzDiagnostics.updateController(command.ptzDebug);
+
+    /*
+     * Сквозной лог выводится после прохождения Dispatcher и Driver.
+     * Здесь только обновляется состояние Controller.
+     */
+
+    return command;
   }
 
   /** Передаёт команду асинхронному диспетчеру без ожидания сети. */
@@ -205,6 +381,9 @@ class CameraController {
 
   reset(reason = 'RESET') {
     this.filter.reset();
+    this.fineCenteringController.reset();
+    this.previousPanSpeed = 0;
+    this.previousTiltSpeed = 0;
     this.commandDispatcher?.stopMotion(reason);
     logger.info(`[CAMERA] Контур наведения сброшен: ${reason}`);
   }
@@ -217,6 +396,9 @@ class CameraController {
       panSpeed: 0,
       tiltSpeed: 0,
       zoomSpeed: 0,
+      zoomLocked: this.zoomLockedDuringTracking,
+      requestedPanSpeed: 0,
+      requestedTiltSpeed: 0,
       errorX: 0,
       errorY: 0,
       moving: false,
@@ -225,8 +407,17 @@ class CameraController {
       controlPoint: null,
       velocity: { x: 0, y: 0 },
       kalmanEnabled: this.kalmanEnabled,
+      ptzMode: 'STOP',
+      fineCentering: null,
       reason,
     };
+  }
+
+  #directionBySign(error, negative, positive, inverted) {
+    let direction = Number(error) < 0 ? negative : positive;
+
+    if (!inverted) return direction;
+    return direction === negative ? positive : negative;
   }
 
   #axisDirection(error, deadZone, negative, positive, inverted) {
@@ -244,6 +435,22 @@ class CameraController {
     const low = Math.min(minSpeed, maxSpeed);
     const high = Math.max(minSpeed, maxSpeed);
     return low + normalized * (high - low);
+  }
+
+  #limitSpeedChange(requested, previous, limit, forceStop) {
+    if (forceStop || requested <= 0) {
+      return 0;
+    }
+
+    /*
+     * limit=1 фактически отключает ограничение.
+     * При limit=0.03 скорость может измениться максимум на 0.03
+     * за одну рассчитанную команду.
+     */
+    const delta = requested - previous;
+    const limitedDelta = Math.min(limit, Math.max(-limit, delta));
+
+    return this.#clampSpeed(previous + limitedDelta);
   }
 
   #isValidPoint(point) {
